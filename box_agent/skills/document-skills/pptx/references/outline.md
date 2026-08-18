@@ -141,10 +141,9 @@ beside the future `deck.json`:
 In output mode, file-tool paths are already relative to the presentation
 artifact root. Use `write_file(path="outline.json", ...)`; do not pass the
 absolute session-workspace path and do not add another `output/` prefix. When
-the complete JSON exceeds the single-call limit, use one
-`staged_file_write` transaction whose `begin` call also uses
-`path="outline.json"`, then reuse the exact returned `write_id` through ordered
-`append_text` calls and `commit`.
+the complete JSON cannot fit in one model response, use ordered `write_file`
+calls for `path="outline.json"`: start with `chunk_index=0, final=false`,
+increment the index for each chunk, and set `final=true` on the last chunk.
 
 For `source_mode=user_provided`, user-stated solution requirements and proposed
 architecture scope are valid planning inputs; make unsupplied implementation

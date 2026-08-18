@@ -8,6 +8,38 @@ from box_agent.tools.mcp_config_tool import McpConfigTool
 
 
 @pytest.mark.asyncio
+async def test_list_is_config_only_and_does_not_expose_connection_secrets(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "search": {
+                        "url": "https://example.test/mcp?apiKey=secret-token",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "box_agent.tools.mcp_config_tool._resolve_write_target",
+        lambda: config_path,
+    )
+
+    result = await McpConfigTool().execute(action="list")
+
+    assert result.success is True
+    assert "not a tool inventory" in result.content
+    assert "tool_search" in result.content
+    assert "transport=url" in result.content
+    assert "secret-token" not in result.content
+
+
+@pytest.mark.asyncio
 async def test_inspect_browser_reports_current_headed_isolated_config(
     tmp_path,
     monkeypatch,
@@ -276,3 +308,28 @@ async def test_update_changes_fields_and_removes_fields(
         "url": "https://new.example/mcp",
         "execute_timeout": 60,
     }
+
+
+@pytest.mark.asyncio
+async def test_add_preserves_explicit_always_load_and_reports_pending_runtime(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text('{"mcpServers": {}}', encoding="utf-8")
+    monkeypatch.setattr(
+        "box_agent.tools.mcp_config_tool._resolve_write_target",
+        lambda: config_path,
+    )
+
+    result = await McpConfigTool().execute(
+        action="add",
+        name="core",
+        config={"command": "node", "args": ["server.js"], "alwaysLoad": True},
+    )
+
+    assert result.success is True
+    assert "only the configuration write" in result.content
+    assert "pending" in result.content
+    written = json.loads(config_path.read_text(encoding="utf-8"))
+    assert written["mcpServers"]["core"]["alwaysLoad"] is True

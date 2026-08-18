@@ -266,6 +266,32 @@ class TestMCPToolExecution:
     """Tests for defensive normalization of remote MCP results."""
 
     @pytest.mark.asyncio
+    async def test_invalid_remote_schema_fails_closed_without_leaking_arguments(self):
+        class FakeSession:
+            calls = 0
+
+            async def call_tool(self, name, arguments):
+                self.calls += 1
+                raise AssertionError("invalid schema must block remote execution")
+
+        session = FakeSession()
+        tool = MCPTool(
+            name="remote_secret_tool",
+            description="remote tool with a malformed schema",
+            parameters={"type": "definitely-not-a-json-schema-type"},
+            session=session,
+        )
+        secret = "TOP_SECRET_ARGUMENT_VALUE"
+
+        result = await tool.invoke({"token": secret})
+
+        assert result.success is False
+        assert result.raw_output["code"] == "INVALID_TOOL_SCHEMA"
+        assert secret not in (result.error or "")
+        assert secret not in str(result.raw_output)
+        assert session.calls == 0
+
+    @pytest.mark.asyncio
     async def test_structured_error_envelope_is_failure_without_is_error_flag(self):
         class FakeSession:
             async def call_tool(self, name, arguments):

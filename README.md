@@ -106,10 +106,10 @@ model: "your-model"
 
 ### Staged Context Compression
 
-- **Layer 0 — Large content**: Generated-artifact reads are compacted immediately. Large write/edit arguments remain intact for one subsequent model turn, then become structured placeholders so the model can confirm success without repeatedly paying the full context cost.
+- **Layer 0 — Large tool results**: Generated-artifact read results are compacted before entering model history. Tool-call arguments are not independently compacted and remain verbatim until a whole-history summary replaces their turn.
 - **Layer 1 — Micro-compact**: Every step, older tool results are replaced with short placeholders. Zero cost, no LLM call.
 - **Layer 2 — Auto-summary**: When tokens exceed the derived threshold (about 104k tokens for user-configured endpoints by default), an LLM call summarizes the conversation. Original data is preserved in logs.
-- **Self-healing guard**: Internal history placeholders are rejected if a later model turn tries to reuse them as executable file/code arguments; Box-Agent requests one clean regeneration instead of writing the placeholder to disk.
+- **Legacy safety guard**: Internal history placeholders from older or externally supplied sessions are rejected if a model tries to reuse them as executable file/code arguments; Box-Agent requests one clean regeneration instead of writing the placeholder to disk.
 
 ### More
 

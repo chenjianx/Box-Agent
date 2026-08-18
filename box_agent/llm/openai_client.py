@@ -134,13 +134,14 @@ def _recover_sensenova_tool_calls_from_thinking(
                 parameter_types[name][parameter_name],
             )
         arguments_len = len(json.dumps(arguments, ensure_ascii=False))
-        if arguments_len > streamed_argument_limit(name):
+        limit = streamed_argument_limit(name)
+        if limit is not None and arguments_len > limit:
             logger.warning(
                 "Ignored oversized SenseNova tool call recovered from thinking: "
                 "name=%s arguments_len=%d limit=%d",
                 name,
                 arguments_len,
-                streamed_argument_limit(name),
+                limit,
             )
             continue
         recovered.append(
@@ -910,7 +911,7 @@ class OpenAIClient(LLMClientBase):
                                         },
                                     )
                                 limit = streamed_argument_limit(entry["name"])
-                                if arguments_len > limit:
+                                if limit is not None and arguments_len > limit:
                                     oversized_info.append(
                                         {
                                             "name": entry["name"] or "",

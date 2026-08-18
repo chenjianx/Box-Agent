@@ -9,6 +9,7 @@ all partial output.
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -138,6 +139,34 @@ async def test_stream_stops_oversized_tool_arguments_before_json_parse(monkeypat
         {"name": "bash", "arguments_len": 32, "limit": 12}
     ]
     assert any(event.type == "activity" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_stream_does_not_apply_a_local_argument_cap_to_write_file():
+    content = "x" * 20_000
+    arguments = json.dumps({"path": "large.txt", "content": content})
+    stream = _AsyncIter(
+        [
+            _chunk(
+                tool_calls=[_tool_delta("write_file", arguments)],
+                finish_reason="tool_calls",
+            ),
+        ]
+    )
+
+    async def factory(**kwargs):
+        return _raw_response(stream)
+
+    client, _ = _build_client(factory, retries=0)
+    events = [
+        event
+        async for event in client.generate_stream([Message(role="user", content="hi")])
+    ]
+
+    finish = events[-1]
+    assert finish.finish_reason == "tool_calls"
+    assert finish.oversized_tool_calls is None
+    assert finish.tool_calls[0].function.arguments["content"] == content
 
 
 @pytest.mark.asyncio

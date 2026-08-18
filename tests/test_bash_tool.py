@@ -28,6 +28,7 @@ async def test_rejects_oversized_command_before_execution():
     assert result.error is not None
     assert result.error.startswith("BASH_ARGUMENT_TOO_LARGE")
     assert bash_tool.parameters["properties"]["command"]["maxLength"] == MAX_BASH_COMMAND_CHARS
+    assert bash_tool.parameters["additionalProperties"] is False
 
 
 @pytest.mark.asyncio

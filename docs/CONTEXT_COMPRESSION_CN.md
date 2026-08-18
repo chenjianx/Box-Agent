@@ -76,16 +76,16 @@ Layer 0 在代码顺序中最后执行，但对任何单条 tool 结果来说它
 
 | 层 | 触发条件 | 成本 | 作用对象 | 压缩范围 |
 | - | -------- | ---- | -------- | -------- |
-| 0 — 模型可见内容 / 参数 | 每次工具调用，以及后续一次模型请求完成后 | 0 LLM，O(content) | 单条工具结果或 assistant 工具调用消息 | 生成型 artifact 工具输出与大型 mutation 参数 |
+| 0 — 模型可见工具内容 | 每次工具调用 | 0 LLM，O(content) | 单条工具结果 | 生成型 artifact 工具输出 |
 | 1 — `_micro_compact` | 每步 | 0 LLM，O(messages) | 整个 `messages` 列表，原地修改 | 旧的 tool-role 消息 |
 | 2 — `_maybe_summarize` | `_estimate_tokens > token_limit` 或 `api_total_tokens > token_limit` | 每轮 1 次 LLM 调用 | 整个 `messages` 列表，整体替换 | assistant + tool 执行序列 |
 | Cleanup — `_cleanup_incomplete_messages` | abort 路径（cancel / max_tokens / 空流 / 错误） | 0 LLM | `messages` 尾部 | 仅当前正在进行的 incomplete turn |
 
-## Layer 0 — 模型可见工具内容 & 参数压缩
+## Layer 0 — 模型可见工具内容压缩
 
 有选择地缩减模型可见历史中的生成型 artifact 内容。工具结果在 append 前压缩；
-大型 mutation 参数会完整保留到后续一次模型请求完成，再执行压缩。这样模型有一次
-机会同时看到真实参数和对应工具结果，后续轮次只承担结构化摘要成本。完整内容仍然：
+工具调用参数不再被单独压缩，在 Layer 2 用整段历史摘要替换其所在轮次前，
+会在后续模型轮次的 assistant 历史中保留原文。工具结果的完整内容仍然：
 - 作为 `ToolCallResult` 发给事件消费者（CLI / ACP / 子 agent），
 - 写入磁盘 `{workspace}/output/`，
 - 在 agent 日志中原文记录。
@@ -107,18 +107,9 @@ Layer 0 在代码顺序中最后执行，但对任何单条 tool 结果来说它
   …
   ```
 
-**被压缩的工具调用参数**（`_compact_tool_call_arguments_for_model`）
-- `write_file.content` 与 `edit_file.{old_str, new_str}` 若路径匹配
-  `_MODEL_CONTEXT_PATH_EXTS`，替换为带 12–20 行预览的结构化占位符。
-- 兜底：任何字符串参数若长度大于 `_MODEL_CONTEXT_CONTENT_THRESHOLD`，
-  一律压缩。
-- Assistant 消息最初保留完整参数。任何参数需要压缩时，
-  `pending_history_compaction` 会指向该消息；下一次 provider 请求完成后，
-  `_compact_pending_tool_call_history` 通过 `_tool_calls_for_model_history` 替换参数。
-  取消或 provider 错误也会清空 pending 压缩，避免大型参数无限期留在历史中。
-
 **占位符执行保护**
-- `box_agent/model_history.py` 中的三个前缀表示内部历史摘要，不是可执行内容。
+- `box_agent/model_history.py` 中的三个前缀表示旧版/内部历史摘要，不是可执行内容。
+  当前实现不会再把工具调用参数转换为这些占位符。
 - 如果后续模型把它复制进 `write_file`、`append_file`、`edit_file` 或
   `execute_code`，core 会在 hook、权限检查、artifact 扫描和文件修改前拒绝调用。
 - 第一次出现对用户隐藏，并注入一次重生成请求；重复出现则变成可见工具错误。
@@ -131,7 +122,7 @@ Layer 0 在代码顺序中最后执行，但对任何单条 tool 结果来说它
 - 路径片段启发式：路径中包含 `qa/` 的任何文件
 
 路径启发式会为常见生成型 artifact 提供可读预览；纯尺寸兜底仍覆盖其它路径或后缀
-中的大型内容。
+中的大型工具结果。
 
 ## Layer 1 — 微压缩（每步）
 
@@ -425,7 +416,8 @@ incomplete）。
 | `test_cleanup_keeps_complete_tool_call_turn` | cleanup | 所有 tool 响应齐全 → 保留 |
 | `test_cleanup_keeps_thinking_only_assistant` | cleanup | 仅 thinking 也算输出 |
 | `test_cleanup_noop_when_no_assistant_turn` | cleanup | 空对话上 no-op |
-| `test_consecutive_html_writes_delay_compaction_for_one_model_turn` | 0 | mutation 正文完整保留一次请求后再压缩 |
+| `test_consecutive_html_writes_remain_visible_in_all_model_turns` | 0 | mutation 正文在后续未摘要的模型轮次中保持原文 |
+| `test_large_generic_tool_arguments_remain_in_model_history` | 0 | 大型非文件参数同样保持原文 |
 | `test_model_history_placeholder_write_is_hidden_and_self_heals` | 0 | 占位符不会写盘，并只触发一次修复 |
 
 ## 待优化项
@@ -447,13 +439,8 @@ incomplete）。
     `_MODEL_CONTEXT_PATH_NAMES`、`_MODEL_CONTEXT_PATH_PARTS`、
     `_MODEL_CONTEXT_CONTENT_THRESHOLD`
   - Layer 0：`_compact_visible_tool_content_for_model`、
-    `_compact_tool_call_arguments_for_model`、
-    `_tool_calls_for_model_history`、
-    `_tool_calls_need_model_history_compaction`、
     `_model_history_placeholder_argument`、
-    `_summarize_tool_argument_for_model`、
-    `_path_needs_compact_model_context`、
-    `_tool_argument_needs_compaction`
+    `_path_needs_compact_model_context`
   - Layer 1：`_micro_compact`、`_approx_tokens_for_content`
   - Layer 2：`_maybe_summarize`、`_create_summary`、`_is_summary_marker`
   - Cleanup：`_cleanup_incomplete_messages`

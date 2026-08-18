@@ -84,19 +84,18 @@ given tool result.
 
 | Layer | Trigger | Cost | Operates on | Scope of compression |
 | ----- | ------- | ---- | ----------- | -------------------- |
-| 0 — visible tool content / arguments | Per tool call and after one subsequent model request | 0 LLM, O(content) | Single tool result or assistant tool-call message | Generated-artifact tool outputs and large mutation arguments |
+| 0 — visible tool content | Per tool call | 0 LLM, O(content) | Single tool result | Generated-artifact tool outputs |
 | 1 — `_micro_compact` | Every step | 0 LLM, O(messages) | Whole `messages` list, in place | Old tool-role messages |
 | 2 — `_maybe_summarize` | `_estimate_tokens > token_limit` or `api_total_tokens > token_limit` | 1 LLM call per round | Whole `messages` list, replaces | Assistant + tool exec sequences |
 | Cleanup — `_cleanup_incomplete_messages` | Abort paths (cancel / max_tokens / empty stream / error) | 0 LLM | Tail of `messages` | Incomplete in-flight turn only |
 
-## Layer 0 — Visible tool content & argument compaction
+## Layer 0 — Visible tool content compaction
 
 Selectively shrinks generated-artifact content in model-visible history. Tool
-results are compacted before append. Large mutation arguments are retained for
-exactly one subsequent model request, then compacted after that request
-completes or fails. This lets the model see the real argument and matching tool
-result once before later turns pay only for the structured summary. The full
-content is still:
+results are compacted before append. Tool-call arguments are not independently
+compacted: they remain verbatim in assistant history across later model turns
+until Layer 2 replaces the containing turn with a whole-history summary. The
+full tool-result content is still:
 - emitted as `ToolCallResult` to event consumers (CLI/ACP/sub-agent),
 - written to disk under `{workspace}/output/`,
 - logged verbatim in the agent log.
@@ -118,22 +117,10 @@ content is still:
   …
   ```
 
-**Compacted tool-call arguments** (`_compact_tool_call_arguments_for_model`)
-- `write_file.content` and `edit_file.{old_str,new_str}` with paths
-  matching `_MODEL_CONTEXT_PATH_EXTS` get a structured placeholder with
-  a 12–20 line preview.
-- Catch-all: any string argument >`_MODEL_CONTEXT_CONTENT_THRESHOLD`
-  characters is compacted.
-- The assistant message initially keeps the full argument. When any argument
-  needs compaction, `pending_history_compaction` points to that message; after
-  the next provider request, `_compact_pending_tool_call_history` replaces the
-  arguments through `_tool_calls_for_model_history`. Cancellation and provider
-  errors also drain the pending compaction so large arguments cannot remain in
-  history indefinitely.
-
 **Placeholder execution guard**
-- The three prefixes in `box_agent/model_history.py` identify internal history
-  summaries, not executable content.
+- The three prefixes in `box_agent/model_history.py` identify legacy/internal
+  history summaries, not executable content. Current tool-call arguments are
+  no longer converted into these placeholders.
 - If a later model turn copies one into `write_file`, `append_file`,
   `edit_file`, or `execute_code`, the core rejects the tool call before hooks,
   permission checks, artifact scans, or file mutation.
@@ -466,7 +453,8 @@ Coverage lives in `tests/test_core.py`:
 | `test_cleanup_keeps_complete_tool_call_turn` | cleanup | All tool responses present → keep |
 | `test_cleanup_keeps_thinking_only_assistant` | cleanup | Thinking counts as output |
 | `test_cleanup_noop_when_no_assistant_turn` | cleanup | No-op on bare conversation |
-| `test_consecutive_html_writes_delay_compaction_for_one_model_turn` | 0 | Full mutation content survives one request, then compacts |
+| `test_consecutive_html_writes_remain_visible_in_all_model_turns` | 0 | Full mutation content remains exact across later unsummarized model turns |
+| `test_large_generic_tool_arguments_remain_in_model_history` | 0 | Large non-file arguments also remain exact |
 | `test_model_history_placeholder_write_is_hidden_and_self_heals` | 0 | Placeholder is never written and gets one repair attempt |
 
 ## Open improvements
@@ -491,13 +479,8 @@ listed here so future work can pick them up with context.
     `_MODEL_CONTEXT_PATH_EXTS`, `_MODEL_CONTEXT_PATH_NAMES`,
     `_MODEL_CONTEXT_PATH_PARTS`, `_MODEL_CONTEXT_CONTENT_THRESHOLD`
   - Layer 0: `_compact_visible_tool_content_for_model`,
-    `_compact_tool_call_arguments_for_model`,
-    `_tool_calls_for_model_history`,
-    `_tool_calls_need_model_history_compaction`,
     `_model_history_placeholder_argument`,
-    `_summarize_tool_argument_for_model`,
-    `_path_needs_compact_model_context`,
-    `_tool_argument_needs_compaction`
+    `_path_needs_compact_model_context`
   - Layer 1: `_micro_compact`, `_approx_tokens_for_content`
   - Layer 2: `_maybe_summarize`, `_create_summary`,
     `_is_summary_marker`

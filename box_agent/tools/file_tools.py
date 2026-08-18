@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
 import threading
 import time
+import uuid
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
@@ -24,6 +27,8 @@ if TYPE_CHECKING:
 
 MAX_FILE_TOOL_CONTENT_CHARS = MAX_GENERATED_BODY_CHARS
 MAX_FILE_TOOL_CONTENT_CHARS_DISPLAY = f"{MAX_FILE_TOOL_CONTENT_CHARS:,}"
+MAX_WRITE_FILE_BYTES = 10 * 1024 * 1024
+MAX_WRITE_FILE_CHUNKS = 2_048
 DEFAULT_SEARCH_LIMIT = 50
 MAX_SEARCH_RESULTS = 200
 MAX_SEARCH_OFFSET = 10_000
@@ -104,10 +109,9 @@ def _oversized_file_tool_argument_error(tool_name: str, argument_name: str, valu
     return (
         f"FILE_TOOL_ARGUMENT_TOO_LARGE: {tool_name}.{argument_name} is "
         f"{len(value)} characters; limit is {MAX_FILE_TOOL_CONTENT_CHARS}. "
-        "For large generated artifacts such as HTML/CSS/JS, JSON manifests, "
-        "templates, base64, or file bodies, use staged_file_write: begin, append_text "
-        "or append_file in ordered chunks, then commit and validate with read_file "
-        "or a render check."
+        "Split this append/edit operation into smaller calls. To replace a complete "
+        "large artifact atomically, use ordered write_file chunks and validate with "
+        "read_file or a render check."
     )
 
 
@@ -618,8 +622,29 @@ class SearchFilesTool(EventEmittingTool):
             return ToolResult(success=False, content="", error=str(exc))
 
 
+@dataclass(slots=True)
+class _PendingTextWrite:
+    """One path-keyed write transaction hidden from the model interface."""
+
+    target: Path
+    temporary: Path
+    next_index: int = 0
+    size_bytes: int = 0
+    chunk_hashes: dict[int, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _CommittedTextWrite:
+    """Terminal receipt retained for idempotent final-chunk replay."""
+
+    final_chunk_index: int
+    final_chunk_sha256: str
+    file_sha256: str
+    result: ToolResult
+
+
 class WriteTool(Tool):
-    """Write content to a file."""
+    """Atomically write a UTF-8 file in one call or ordered chunks."""
 
     def __init__(
         self,
@@ -642,6 +667,8 @@ class WriteTool(Tool):
         )
         self.allow_full_access = allow_full_access
         self._perm = permission_engine
+        self._pending: dict[Path, _PendingTextWrite] = {}
+        self._committed: dict[Path, _CommittedTextWrite] = {}
 
     @property
     def name(self) -> str:
@@ -650,12 +677,14 @@ class WriteTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Write content to a file. Will overwrite existing files completely. "
-            "For existing files, you should read the file first using read_file. "
-            "Prefer editing existing files over creating new ones unless explicitly needed. "
-            f"Keep content under {MAX_FILE_TOOL_CONTENT_CHARS_DISPLAY} characters; "
-            "for larger generated artifacts, use staged_file_write from begin through "
-            "ordered append_text or append_file chunks to commit."
+            "Atomically write UTF-8 text to a file, replacing any existing file. "
+            "Small files need only path and content. For a large file, send ordered "
+            "chunks to the same path. Start a new transaction with chunk_index=0 and "
+            "final=false; after an accepted chunk, continue from the next_chunk_index "
+            "returned by that successful result. Set final=true on the last chunk. "
+            "The target remains unchanged until the final chunk commits. Transactions "
+            f"support at most {MAX_WRITE_FILE_CHUNKS:,} chunks and "
+            f"{MAX_WRITE_FILE_BYTES:,} total UTF-8 bytes."
         )
 
     @property
@@ -669,70 +698,301 @@ class WriteTool(Tool):
                 },
                 "content": {
                     "type": "string",
-                    "maxLength": MAX_FILE_TOOL_CONTENT_CHARS,
+                    "description": "Complete file content or the current ordered chunk.",
+                },
+                "chunk_index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Zero-based chunk sequence number (default: 0).",
+                },
+                "final": {
+                    "type": "boolean",
+                    "default": True,
                     "description": (
-                        "Complete content to write (will replace existing content). "
-                        f"Keep this under {MAX_FILE_TOOL_CONTENT_CHARS_DISPLAY} "
-                        "characters. For large generated artifacts such as HTML/CSS/JS, "
-                        "JSON manifests, templates, base64, or file bodies, use "
-                        "staged_file_write with begin, ordered append_text or append_file "
-                        "chunks, and commit, then validate."
+                        "Commit after this content. Omit or use true for a complete "
+                        "small file; use false until the last chunk of a large file."
                     ),
                 },
             },
             "required": ["path", "content"],
+            "additionalProperties": False,
         }
 
-    async def execute(self, path: str, content: str) -> ToolResult:
-        """Execute write file."""
-        try:
-            # Resolve relative paths from the active project/artifact root.
-            file_path = _resolve_from_active_root(
-                path,
-                workspace_dir=self.workspace_dir,
-                relative_root_dir=self.relative_root_dir,
-            )
+    def _target(self, path: str) -> Path:
+        return _resolve_from_active_root(
+            path,
+            workspace_dir=self.workspace_dir,
+            relative_root_dir=self.relative_root_dir,
+        ).resolve(strict=False)
 
-            # Path validation
-            if self._perm:
-                decision = self._perm.check(
-                    capability="filesystem.write",
-                    resource={"path": str(file_path)},
-                    tool_name=self.name,
+    def _permission_error(self, target: Path) -> ToolResult | None:
+        if self._perm:
+            decision = self._perm.check(
+                capability="filesystem.write",
+                resource={"path": str(target)},
+                tool_name=self.name,
+            )
+            if not decision.allowed:
+                return ToolResult(
+                    success=False,
+                    error=decision.reason,
+                    permission_request=decision.permission_request,
                 )
-                if not decision.allowed:
+        elif not self.allow_full_access:
+            error = validate_path_in_workspace(target, self.workspace_dir)
+            if error:
+                return ToolResult(success=False, error=error)
+        return None
+
+    @staticmethod
+    def _write_bytes(path: Path, data: bytes, *, append: bool) -> None:
+        with path.open("ab" if append else "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _start(self, target: Path) -> _PendingTextWrite:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.parent / f".{target.name}.box-agent-{uuid.uuid4().hex}.part"
+        self._write_bytes(temporary, b"", append=False)
+        state = _PendingTextWrite(target=target, temporary=temporary)
+        self._committed.pop(target, None)
+        self._pending[target] = state
+        return state
+
+    def _discard(self, state: _PendingTextWrite) -> None:
+        state.temporary.unlink(missing_ok=True)
+        self._pending.pop(state.target, None)
+
+    def _append_chunk(
+        self,
+        state: _PendingTextWrite,
+        chunk_index: int,
+        data: bytes,
+    ) -> ToolResult | None:
+        digest = hashlib.sha256(data).hexdigest()
+        if chunk_index < state.next_index:
+            if state.chunk_hashes.get(chunk_index) == digest:
+                return ToolResult(
+                    success=True,
+                    content=(
+                        f"Chunk {chunk_index} was already accepted for {state.target}; "
+                        f"next chunk_index={state.next_index}."
+                    ),
+                    raw_output={
+                        "type": "write_file_chunk",
+                        "path": str(state.target),
+                        "chunk_index": chunk_index,
+                        "next_chunk_index": state.next_index,
+                        "size_bytes": state.size_bytes,
+                        "duplicate": True,
+                        "final": False,
+                    },
+                )
+            return ToolResult(
+                success=False,
+                error=(
+                    "WRITE_FILE_CHUNK_CONFLICT: chunk_index="
+                    f"{chunk_index} was already accepted with different content."
+                ),
+            )
+        if chunk_index > state.next_index:
+            return ToolResult(
+                success=False,
+                error=(
+                    f"WRITE_FILE_CHUNK_OUT_OF_ORDER: expected {state.next_index}, "
+                    f"got {chunk_index}."
+                ),
+            )
+        if state.next_index >= MAX_WRITE_FILE_CHUNKS:
+            return ToolResult(
+                success=False,
+                error=(
+                    "WRITE_FILE_TOO_MANY_CHUNKS: limit is "
+                    f"{MAX_WRITE_FILE_CHUNKS:,} chunks."
+                ),
+            )
+        if state.size_bytes + len(data) > MAX_WRITE_FILE_BYTES:
+            return ToolResult(
+                success=False,
+                error=(
+                    "WRITE_FILE_TOTAL_SIZE_EXCEEDED: limit is "
+                    f"{MAX_WRITE_FILE_BYTES:,} UTF-8 bytes."
+                ),
+            )
+        self._write_bytes(state.temporary, data, append=True)
+        state.chunk_hashes[chunk_index] = digest
+        state.next_index += 1
+        state.size_bytes += len(data)
+        return None
+
+    def _commit(self, state: _PendingTextWrite) -> ToolResult:
+        if error := self._permission_error(state.target):
+            return error
+        assembled_content = state.temporary.read_text(encoding="utf-8")
+        placeholder_error = _model_history_placeholder_error(assembled_content)
+        if placeholder_error:
+            self._discard(state)
+            return ToolResult(success=False, error=placeholder_error)
+        bypass_error = detect_pptx_self_check_bypass(
+            str(state.target), assembled_content
+        )
+        if bypass_error:
+            self._discard(state)
+            return ToolResult(success=False, error=bypass_error)
+        digest = self._sha256_file(state.temporary)
+        backup_path = backup_file(state.target)
+        os.replace(state.temporary, state.target)
+        self._pending.pop(state.target, None)
+        result = ToolResult(
+            success=True,
+            content=(
+                f"Successfully wrote {state.target} "
+                f"({state.size_bytes} bytes, sha256={digest})."
+            ),
+            raw_output={
+                "type": "artifact",
+                "path": str(state.target),
+                "size_bytes": state.size_bytes,
+                "sha256": digest,
+                "chunks": state.next_index,
+                "final": True,
+                "backup_path": str(backup_path) if backup_path is not None else None,
+            },
+        )
+        final_chunk_index = state.next_index - 1
+        self._committed[state.target] = _CommittedTextWrite(
+            final_chunk_index=final_chunk_index,
+            final_chunk_sha256=state.chunk_hashes[final_chunk_index],
+            file_sha256=digest,
+            result=result.model_copy(deep=True),
+        )
+        return result
+
+    def _committed_replay(
+        self,
+        target: Path,
+        chunk_index: int,
+        data: bytes,
+        *,
+        final: bool,
+    ) -> ToolResult | None:
+        if not final:
+            return None
+        receipt = self._committed.get(target)
+        if receipt is None or chunk_index != receipt.final_chunk_index:
+            return None
+        digest = hashlib.sha256(data).hexdigest()
+        if digest == receipt.final_chunk_sha256:
+            target_matches = (
+                target.is_file()
+                and self._sha256_file(target) == receipt.file_sha256
+            )
+            if not target_matches:
+                if chunk_index > 0:
                     return ToolResult(
                         success=False,
-                        error=decision.reason,
-                        permission_request=decision.permission_request,
+                        error=(
+                            "WRITE_FILE_COMMITTED_STATE_CHANGED: the committed target "
+                            "no longer matches the final receipt."
+                        ),
                     )
-            elif not self.allow_full_access:
-                error = validate_path_in_workspace(file_path, self.workspace_dir)
-                if error:
-                    return ToolResult(success=False, content="", error=error)
+                return None
+            return receipt.result.model_copy(deep=True)
+        if chunk_index > 0:
+            return ToolResult(
+                success=False,
+                error=(
+                    "WRITE_FILE_FINAL_CHUNK_CONFLICT: committed chunk_index="
+                    f"{chunk_index} had different content."
+                ),
+            )
+        return None
 
-            placeholder_error = _model_history_placeholder_error(content)
-            if placeholder_error:
-                return ToolResult(success=False, content="", error=placeholder_error)
+    async def execute(
+        self,
+        path: str,
+        content: str,
+        chunk_index: int = 0,
+        final: bool = True,
+    ) -> ToolResult:
+        """Write one complete file or advance a path-keyed chunk transaction."""
+        try:
+            target = self._target(path)
+            if error := self._permission_error(target):
+                return error
+            data = content.encode("utf-8")
+            state = self._pending.get(target)
+            if state is None:
+                replay = self._committed_replay(
+                    target,
+                    chunk_index,
+                    data,
+                    final=final,
+                )
+                if replay is not None:
+                    return replay
+                if chunk_index != 0:
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            "WRITE_FILE_TRANSACTION_NOT_FOUND: no active write for "
+                            f"{target}; start with chunk_index=0."
+                        ),
+                    )
+                state = self._start(target)
+                started = True
+            else:
+                started = False
 
-            size_error = _oversized_file_tool_argument_error(self.name, "content", content)
-            if size_error:
-                return ToolResult(success=False, content="", error=size_error)
+            append_result = self._append_chunk(
+                state,
+                chunk_index,
+                data,
+            )
+            if append_result is not None:
+                if started and state.next_index == 0:
+                    self._discard(state)
+                return append_result
+            if final:
+                return self._commit(state)
+            return ToolResult(
+                success=True,
+                content=(
+                    f"Accepted chunk {chunk_index} for {target}; "
+                    f"next chunk_index={state.next_index}."
+                ),
+                raw_output={
+                    "type": "write_file_chunk",
+                    "path": str(target),
+                    "chunk_index": chunk_index,
+                    "next_chunk_index": state.next_index,
+                    "size_bytes": state.size_bytes,
+                    "duplicate": False,
+                    "final": False,
+                },
+            )
+        except (OSError, UnicodeError) as exc:
+            return ToolResult(success=False, error=f"WRITE_FILE_FAILED: {exc}")
 
-            bypass_error = detect_pptx_self_check_bypass(str(file_path), content)
-            if bypass_error:
-                return ToolResult(success=False, content="", error=bypass_error)
+    def cleanup_pending_writes(self) -> list[str]:
+        """Discard incomplete chunk transactions at the end of a session turn."""
 
-            # Backup existing file before overwrite
-            backup_file(file_path)
-
-            # Create parent directories if they don't exist
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-
-            file_path.write_text(content, encoding="utf-8")
-            return ToolResult(success=True, content=f"Successfully wrote to {file_path}")
-        except Exception as e:
-            return ToolResult(success=False, content="", error=str(e))
+        cleaned: list[str] = []
+        for target, state in list(self._pending.items()):
+            self._discard(state)
+            cleaned.append(str(target))
+        self._committed.clear()
+        return cleaned
 
 
 class AppendTool(Tool):
@@ -762,8 +1022,8 @@ class AppendTool(Tool):
         return (
             "Append content to a file, creating it if it does not exist. "
             f"Keep each content chunk under {MAX_FILE_TOOL_CONTENT_CHARS_DISPLAY} "
-            "characters. For a generated artifact whose complete body exceeds that "
-            "limit, use staged_file_write so the target changes only at commit."
+            "characters; use multiple append calls when needed. To atomically replace "
+            "a complete large artifact, use ordered write_file chunks."
         )
 
     @property
@@ -781,8 +1041,8 @@ class AppendTool(Tool):
                     "description": (
                         "Content chunk to append. Keep this under "
                         f"{MAX_FILE_TOOL_CONTENT_CHARS_DISPLAY} characters. "
-                        "For a large generated artifact, use staged_file_write with "
-                        "ordered chunks and commit, then validate the final file."
+                        "Use multiple append calls when needed, or ordered write_file "
+                        "chunks to atomically replace a complete artifact."
                     ),
                 },
             },
@@ -824,7 +1084,9 @@ class AppendTool(Tool):
                 return ToolResult(success=False, content="", error=size_error)
 
             existing = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
-            bypass_error = detect_pptx_self_check_bypass(str(file_path), f"{existing}\n{content}")
+            bypass_error = detect_pptx_self_check_bypass(
+                str(file_path), f"{existing}\n{content}"
+            )
             if bypass_error:
                 return ToolResult(success=False, content="", error=bypass_error)
 
@@ -949,7 +1211,9 @@ class EditTool(Tool):
                 if size_error:
                     return ToolResult(success=False, content="", error=size_error)
 
-            bypass_error = detect_pptx_self_check_bypass(str(file_path), f"{content}\n{old_str}\n{new_str}")
+            bypass_error = detect_pptx_self_check_bypass(
+                str(file_path), f"{content}\n{old_str}\n{new_str}"
+            )
             if bypass_error:
                 return ToolResult(success=False, content="", error=bypass_error)
 

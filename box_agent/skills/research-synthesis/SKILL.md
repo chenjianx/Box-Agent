@@ -92,15 +92,21 @@ simple factual lookup, one-source Q&A, or ordinary code changes.
   browser tool. In officev3, standalone Playwright MCP tools are separate from
   the read-only browser gateway: do not request `source_preference: playwright`
   on the gateway as a substitute; use the standalone tools, or gateway `auto` /
-  `browser_connector` for real-browser reads.
+  `browser_connector` for real-browser reads. For standalone Playwright, activate
+  the exact `browser_navigate` and `browser_snapshot` tool names together, then
+  verify one URL at a time with `browser_navigate(url)` followed by
+  `browser_snapshot()`. Navigation metadata alone is not a failed body read; the
+  snapshot body is the evidence content bound to that URL.
 - Treat search results as discovery, not evidence. Open the source page before
   marking a claim verified, and capture a short excerpt that actually supports
   the claim and names the target entity. Never transfer a search-result snippet
   directly into the verified evidence ledger.
 - After bounded search, verify no more than five unique exact article, report,
   filing, or data-page URLs. Never use an origin homepage or retry the same URL
-  with the same browser backend. If two consecutive direct reads yield no usable
-  source text, stop browsing, mark the remaining candidates `unverified`, and
+  with the same browser backend. Do not issue parallel Playwright navigations;
+  finish each navigate/snapshot pair before opening another URL. If two
+  consecutive direct reads yield no usable source text, stop browsing, mark the
+  remaining candidates `unverified`, and
   finish the handoff so downstream work can continue in `partial` or `framework`
   mode.
 - Maintain `research/{topic}_evidence.json` while researching. Every downstream

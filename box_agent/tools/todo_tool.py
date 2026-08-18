@@ -298,26 +298,9 @@ class TodoStore:
                 f"Todo #{unknown_ids[0]} does not exist; omit id for a new todo."
             )
 
-        requested_shape = (
-            [
-                (
-                    str(todo["task"]).strip(),
-                    str(
-                        todo.get("priority")
-                        or current_items[index].get("priority")
-                        or "medium"
-                    ),
-                )
-                for index, todo in enumerate(todos)
-            ]
-            if len(todos) == len(current_items)
-            else []
-        )
-        current_shape = [
-            (str(item["task"]).strip(), str(item.get("priority") or "medium"))
-            for item in current_items
-        ]
-        if current_items and requested_shape == current_shape:
+        requested_tasks = [str(todo["task"]).strip() for todo in todos]
+        current_tasks = [str(item["task"]).strip() for item in current_items]
+        if current_items and requested_tasks == current_tasks:
             requested_statuses = [
                 str(todo.get("status") or current_items[index]["status"])
                 for index, todo in enumerate(todos)
@@ -335,18 +318,23 @@ class TodoStore:
                 str(item["id"])
             )
         for todo in todos:
-            if todo.get("id") is not None:
-                continue
             task = str(todo["task"]).strip()
             matching_ids = existing_ids_by_task.get(task)
             if not matching_ids:
                 continue
-            missing_ids = [todo_id for todo_id in matching_ids if todo_id not in seen_ids]
-            if missing_ids:
-                expected = ", ".join(f"#{todo_id}" for todo_id in missing_ids)
+            supplied_id = todo.get("id")
+            if supplied_id is None:
+                expected = ", ".join(f"#{todo_id}" for todo_id in matching_ids)
                 raise ValueError(
                     f"Existing todo '{task}' must preserve its id ({expected}); "
                     "call todo_read before rebuilding the list."
+                )
+            normalized_id = str(supplied_id).strip()
+            if normalized_id not in matching_ids:
+                expected = ", ".join(f"#{todo_id}" for todo_id in matching_ids)
+                raise ValueError(
+                    f"Existing todo '{task}' must preserve its original id "
+                    f"({expected}), not #{normalized_id}."
                 )
 
         candidate_state = []

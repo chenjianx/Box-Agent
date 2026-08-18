@@ -83,6 +83,12 @@ def test_system_prompt_sub_agent_routing_is_cost_aware_and_capability_explicit()
     assert "最多修正重试一次" in prompt
     assert "只有完全没有 `capabilities` 的旧调用" in prompt
     assert "最终合并、交叉校验" in prompt
+    assert '`budget` 必须直接传对象' in prompt
+    assert '"read_only":false' in prompt
+    assert '"network":true' in prompt
+    assert '"write_scope":["research/dim01.md"]' in prompt
+    assert '"external_side_effect":false' in prompt
+    assert "互斥的精确输出路径" in prompt
 
 
 def test_system_prompt_makes_missing_input_a_resumable_pause():

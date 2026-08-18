@@ -114,6 +114,36 @@ async def test_inject_at_step_boundary():
 
 
 @pytest.mark.asyncio
+async def test_hidden_runtime_injection_updates_context_without_user_message():
+    """Internal runtime state reaches the model but is not rendered as user input."""
+    queue: asyncio.Queue[dict] = asyncio.Queue()
+    msgs = _msgs()
+    await queue.put(
+        {
+            "id": "mcp-runtime-1",
+            "content": "MCP server is connected",
+            "user_visible": False,
+            "source": "runtime",
+        }
+    )
+    llm = MockLLM([LLMResponse(content="ready", finish_reason="stop")])
+
+    events = await collect(
+        run_agent_loop(llm=llm, messages=msgs, tools={}, max_steps=5, inject_queue=queue)
+    )
+
+    injected = [e for e in events if isinstance(e, InjectedMessageEvent)]
+    assert len(injected) == 1
+    assert injected[0].injection_id == "mcp-runtime-1"
+    assert injected[0].user_visible is False
+    runtime_message = next(
+        message for message in msgs if "MCP server is connected" in message.content
+    )
+    assert "authoritative runtime context" in runtime_message.content
+    assert "Mid-turn user message" not in runtime_message.content
+
+
+@pytest.mark.asyncio
 async def test_no_tool_calls_continues_with_injection():
     """When LLM wants to stop but inject queue has content, loop continues."""
     queue: asyncio.Queue[str] = asyncio.Queue()

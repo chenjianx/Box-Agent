@@ -95,6 +95,7 @@ from .loop_guards import (
     completion_gate_tool_satisfies_requirements,
     completion_gate_text,
     format_injected_message,
+    format_runtime_context_update,
     looks_like_truncated_output,
     near_limit_wrapup_text,
     no_progress_wrapup_text,
@@ -181,8 +182,13 @@ async def _stream_with_activity(
                 await closer()
             except (RuntimeError, asyncio.CancelledError):
                 pass
-from .schema import FunctionCall, LLMResponse, Message, StreamEvent, ToolCall
-from .tools.base import EventEmittingTool, Tool, ToolResult
+from .schema import LLMResponse, Message, StreamEvent
+from .tools.base import (
+    EventEmittingTool,
+    Tool,
+    ToolInvocationContext,
+    ToolResult,
+)
 from .tools.argument_limits import RECOMMENDED_GENERATED_BODY_CHARS
 from .tools.browser_intent import BrowserToolIntentPolicy
 from .tools.skill_preload import build_active_skills_prompt
@@ -216,16 +222,17 @@ _MODEL_HISTORY_PLACEHOLDER_REPAIR_LIMIT: Final[int] = 1
 _MODEL_HISTORY_PLACEHOLDER_TOOL_ERROR = (
     "INTERNAL_MODEL_HISTORY_PLACEHOLDER: the requested tool argument is an internal "
     "history summary, not executable content. Regenerate the real argument. For static "
-    "artifacts, use staged_file_write instead of moving the body into execute_code."
+    "artifacts, use ordered write_file chunks instead of moving the body into execute_code."
 )
 _MODEL_HISTORY_PLACEHOLDER_REPAIR_GUIDANCE = (
     "An internal model-history placeholder was returned as a tool argument. Regenerate "
     "the missing real content now. Never copy text beginning with "
     "`[Full tool-call argument omitted from model history]`, `[Full file content omitted "
     "from model history]`, or `[Full tool output omitted from model history]` into any "
-    "tool argument. For long static artifacts, use staged_file_write with begin, ordered "
-    "append_text or append_file chunks, and commit; do not move the file body into "
-    "execute_code."
+    "tool argument. For long static artifacts, continue write_file from the "
+    "next_chunk_index returned by the last successful call for that path, or use "
+    "chunk_index=0 only if no chunk has been accepted. Keep final=false until the "
+    "last chunk; do not move the file body into execute_code."
 )
 _MODEL_HISTORY_PLACEHOLDER_RECOVERY_REQUIRED = (
     "INTERNAL_MODEL_HISTORY_PLACEHOLDER_RECOVERY_REQUIRED: a mutation argument was "
@@ -233,8 +240,24 @@ _MODEL_HISTORY_PLACEHOLDER_RECOVERY_REQUIRED = (
     "happen. Complete that exact mutation with regenerated real content before "
     "calling any downstream tool; do not validate, apply, render, or otherwise reuse "
     "the unchanged target. For a rejected file mutation, either retry a file mutation "
-    "with real content for the same target or finish one staged_file_write "
-    "begin/append_text/commit transaction for that target."
+    "with real content for the same target, using ordered write_file chunks when needed."
+)
+
+_OUTPUT_LENGTH_TOOL_RECOVERY = (
+    "The previous response ended because it reached the maximum output length. "
+    "None of its tool calls were executed, and no tool side effects occurred. "
+    "Retry and complete the original task. Do not assume that any tool call from "
+    "that response took effect."
+)
+_OUTPUT_LENGTH_WRITE_FILE_RECOVERY = (
+    "The previous response ended because it reached the maximum output length. "
+    "None of the tool calls in that response were executed, so that response made "
+    "no file-system changes. Previously accepted chunks, if any, are still pending. "
+    "Retry and complete the original task without emitting the entire large file in "
+    "one write_file call. For each path, continue with the next_chunk_index returned "
+    "by its last successful write_file result; use chunk_index=0 only when no chunk "
+    "has been accepted for that path. Keep final=false until the last chunk, then set "
+    "final=true."
 )
 
 _BROWSER_SNAPSHOT_OUTPUT_PATH_ERROR = (
@@ -628,139 +651,6 @@ def _compact_visible_tool_content_for_model(
     )
 
 
-def _summarize_tool_argument_for_model(
-    *,
-    tool_name: str,
-    argument_name: str,
-    value: str,
-    path: str | None = None,
-) -> str:
-    """Return a compact placeholder for large tool-call arguments in history."""
-    lines = value.splitlines()
-    path_obj = Path(path) if path else None
-    preview_limit = 12 if (path_obj and path_obj.suffix.lower() in {".html", ".htm"}) else 20
-    preview = ""
-    is_generated_file_write = (
-        tool_name in {"write_file", "append_file"}
-        and argument_name == "content"
-        and path_obj is not None
-        and path_obj.suffix.lower() in _MODEL_CONTEXT_PATH_EXTS
-    )
-    is_generated_file_edit = (
-        tool_name == "edit_file"
-        and argument_name in {"old_str", "new_str"}
-        and path_obj is not None
-        and path_obj.suffix.lower() in _MODEL_CONTEXT_PATH_EXTS
-    )
-    if not (
-        is_generated_file_write
-        or is_generated_file_edit
-        or (
-            path_obj
-            and (
-                path_obj.name in _MODEL_CONTEXT_PATH_NAMES
-                or ("qa" in path_obj.parts and path_obj.suffix.lower() in _MODEL_CONTEXT_PATH_EXTS)
-            )
-        )
-    ):
-        preview = "\n".join(lines[:preview_limit])
-        if len(preview) > 1200:
-            preview = preview[:1200] + "\n..."
-    summary = [
-        "[Full tool-call argument omitted from model history]",
-        f"Tool: {tool_name}",
-        f"Argument: {argument_name}",
-        f"Path: {path or 'unknown'}",
-        f"Lines: {len(lines)}",
-        f"Characters: {len(value)}",
-        "Reason: the argument was omitted to keep future model turns compact; consult the matching tool result for success or failure, and read the file if exact content is needed.",
-    ]
-    if preview:
-        summary.extend(["", f"Preview first {min(preview_limit, len(lines))} lines:", preview])
-    return "\n".join(summary)
-
-
-def _tool_argument_needs_compaction(tool_name: str, argument_name: str, value: Any, path: str | None) -> bool:
-    """Detect large/generated tool-call arguments that should not stay verbatim."""
-    if not isinstance(value, str):
-        return False
-
-    if tool_name in {"write_file", "append_file"} and argument_name == "content":
-        if path and Path(path).suffix.lower() in _MODEL_CONTEXT_PATH_EXTS:
-            return True
-        return _path_needs_compact_model_context(path, value)
-
-    if tool_name == "edit_file" and argument_name in {"old_str", "new_str"}:
-        if path and _path_needs_compact_model_context(path, value):
-            return True
-        return len(value) > _MODEL_CONTEXT_CONTENT_THRESHOLD
-
-    # Catch accidental inline scripts/HTML in generic tool arguments, while
-    # leaving normal short commands and prompts intact.
-    return len(value) > _MODEL_CONTEXT_CONTENT_THRESHOLD
-
-
-def _compact_tool_call_arguments_for_model(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Compact tool-call arguments before storing assistant calls in history.
-
-    ToolCallStart events, logs, and actual tool execution keep the original
-    arguments.  This affects only future LLM turns, preventing generated files
-    such as ``deck.html`` from being resent after every step.
-    """
-    path = arguments.get("path")
-    path_value = path if isinstance(path, str) else None
-    compacted: dict[str, Any] = {}
-    for key, value in arguments.items():
-        if _tool_argument_needs_compaction(tool_name, key, value, path_value):
-            compacted[key] = _summarize_tool_argument_for_model(
-                tool_name=tool_name,
-                argument_name=key,
-                value=value,
-                path=path_value,
-            )
-        else:
-            compacted[key] = value
-    return compacted
-
-
-def _tool_calls_for_model_history(tool_calls: list[ToolCall] | None) -> list[ToolCall] | None:
-    """Return tool calls safe to keep in model-facing message history."""
-    if not tool_calls:
-        return None
-    return [
-        ToolCall(
-            id=tc.id,
-            type=tc.type,
-            function=FunctionCall(
-                name=tc.function.name,
-                arguments=_compact_tool_call_arguments_for_model(tc.function.name, tc.function.arguments),
-            ),
-        )
-        for tc in tool_calls
-    ]
-
-
-def _tool_calls_need_model_history_compaction(tool_calls: list[ToolCall] | None) -> bool:
-    """Return true when any tool-call argument should be compacted after one turn."""
-    if not tool_calls:
-        return False
-    for tool_call in tool_calls:
-        arguments = tool_call.function.arguments
-        path = arguments.get("path")
-        path_value = path if isinstance(path, str) else None
-        if any(
-            _tool_argument_needs_compaction(
-                tool_call.function.name,
-                argument_name,
-                value,
-                path_value,
-            )
-            for argument_name, value in arguments.items()
-        ):
-            return True
-    return False
-
-
 def _model_history_placeholder_argument(
     tool_name: str,
     arguments: dict[str, Any],
@@ -882,6 +772,8 @@ def _record_model_history_placeholder_recovery_result(
             return None
         return recovery
     if tool_name in _MODEL_HISTORY_FILE_MUTATION_TOOLS:
+        if tool_name == "write_file" and arguments.get("final", True) is False:
+            return recovery
         return None
     if tool_name != "staged_file_write":
         return recovery
@@ -1713,23 +1605,14 @@ def _latest_todo_state_checkpoint(
     for idx in range(len(messages) - 1, -1, -1):
         msg = messages[idx]
         content = msg.content if isinstance(msg.content, str) else ""
-        is_todo_tool_state = (
-            msg.role == "tool"
-            and msg.name in {"todo_write", "todo_read"}
-            and msg.state_checkpoint is not None
-        )
-        is_synthetic_todo_state = (
-            msg.role == "user"
-            and content.startswith(_TODO_STATE_MARKER)
-            and msg.state_checkpoint is not None
-        )
-        if is_todo_tool_state or is_synthetic_todo_state:
+        if msg.role == "user" and content.startswith(_TODO_STATE_MARKER):
+            return idx, msg
+        if msg.role == "tool" and msg.name in {"todo_write", "todo_read"}:
             return (
                 idx,
                 Message(
                     role="user",
-                    content=f"{_TODO_STATE_MARKER}\n\n{msg.state_checkpoint}",
-                    state_checkpoint=msg.state_checkpoint,
+                    content=f"{_TODO_STATE_MARKER}\nTool: {msg.name}\n\n{content}",
                 ),
             )
     return None
@@ -2433,7 +2316,6 @@ def _micro_compact(
             idx
             for idx in reversed(tool_indices)
             if messages[idx].name in {"todo_write", "todo_read"}
-            and messages[idx].state_checkpoint is not None
         ),
         None,
     )
@@ -2677,7 +2559,7 @@ async def run_agent_loop(
     memory_promotion_enabled: bool = False,
     memory_promotion_hit_threshold: int = 5,
     memory_promotion_cooldown_days: int = 14,
-    inject_queue: asyncio.Queue[str] | None = None,
+    inject_queue: asyncio.Queue[Any] | None = None,
     thinking_enabled: bool = False,
     session_id: str = "",
     turn_id: str = "",
@@ -2705,6 +2587,7 @@ async def run_agent_loop(
     current_turn_text: str | None = None,
     context_resource_ledger: ContextResourceLedger | None = None,
     context_resource_dedup_enabled: bool = True,
+    tool_exposure_manager: Any | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Execute the agent loop, yielding structured events.
 
@@ -3075,19 +2958,9 @@ async def run_agent_loop(
     plan_approval_request_id = "plan-" + hashlib.sha1(
         f"{run_start}:{_latest_user_text(messages)}".encode("utf-8", errors="ignore")
     ).hexdigest()[:10]
-    pending_history_compaction: Message | None = None
     model_history_placeholder_repairs = 0
     model_history_framework_error_counts: dict[str, int] = {}
     pending_model_history_recovery: _ModelHistoryPlaceholderRecovery | None = None
-
-    def _compact_pending_tool_call_history() -> None:
-        """Compact the latest large tool arguments after one LLM request saw them."""
-        nonlocal pending_history_compaction
-        pending = pending_history_compaction
-        pending_history_compaction = None
-        if pending is None or not any(message is pending for message in messages):
-            return
-        pending.tool_calls = _tool_calls_for_model_history(pending.tool_calls)
 
     def _compact_repeated_framework_error_for_model(
         *,
@@ -3130,7 +3003,6 @@ async def run_agent_loop(
         # ── Cancellation check (top of step) ────────────────
         # No cleanup needed here — messages are consistent at step boundaries.
         if cancelled():
-            _compact_pending_tool_call_history()
             if hook_mgr.hooks:
                 await hook_mgr.fire_done(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
             yield DoneEvent(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
@@ -3168,19 +3040,36 @@ async def run_agent_loop(
             while not inject_queue.empty():
                 injected_item = inject_queue.get_nowait()
                 injection_id = None
+                user_visible = True
+                injection_source = "user"
                 if isinstance(injected_item, dict):
                     injected_text = str(injected_item.get("content") or "")
                     raw_injection_id = injected_item.get("id")
                     if isinstance(raw_injection_id, str):
                         injection_id = raw_injection_id
+                    raw_user_visible = injected_item.get("user_visible")
+                    if isinstance(raw_user_visible, bool):
+                        user_visible = raw_user_visible
+                    raw_source = injected_item.get("source")
+                    if raw_source == "runtime":
+                        injection_source = "runtime"
                 else:
                     injected_text = str(injected_item)
                 if not injected_text:
                     continue
-                messages.append(
-                    Message(role="user", content=format_injected_message(injected_text))
+                formatted_injection = (
+                    format_runtime_context_update(injected_text)
+                    if injection_source == "runtime"
+                    else format_injected_message(injected_text)
                 )
-                yield InjectedMessageEvent(content=injected_text, injection_id=injection_id)
+                messages.append(
+                    Message(role="user", content=formatted_injection)
+                )
+                yield InjectedMessageEvent(
+                    content=injected_text,
+                    injection_id=injection_id,
+                    user_visible=user_visible,
+                )
 
         has_plan_tool = "plan_write" in tools
         latest_user_text = _latest_user_text(messages)
@@ -3560,6 +3449,14 @@ async def run_agent_loop(
 
         # ── LLM call (streaming) ──────────────────────────────
         tool_list = list(tools.values())
+        offered_mcp_generations: dict[str, int] = {}
+        if tool_exposure_manager is not None:
+            exposure = tool_exposure_manager.prepare_tools(tool_list)
+            tool_list = exposure.tools
+            offered_mcp_generations = exposure.mcp_generations
+        # Apply intent filtering after catalog exposure so an activated MCP
+        # browser tool cannot bypass the same visibility policy as a stable
+        # core/fallback tool.
         tool_list = [
             tool
             for tool in tool_list
@@ -3573,9 +3470,39 @@ async def run_agent_loop(
             if pending_required_tools:
                 tool_list = [
                     tool
-                    for tool_name, tool in tools.items()
-                    if tool_name in pending_required_tools
+                    for tool in tool_list
+                    if tool.name in pending_required_tools
+                    or (
+                        tool_exposure_manager is not None
+                        and tool.name == "tool_search"
+                    )
                 ]
+        offered_tools_by_name = {tool.name: tool for tool in tool_list}
+        offered_tool_names = frozenset(offered_tools_by_name)
+
+        def _tool_target_identity(tool_name: str) -> tuple[str | None, str | None]:
+            tool = offered_tools_by_name.get(tool_name)
+            tool_id = getattr(tool, "mcp_tool_id", None)
+            server_name = getattr(tool, "server_name", None)
+            return (
+                tool_id if isinstance(tool_id, str) and tool_id else None,
+                server_name if isinstance(server_name, str) and server_name else None,
+            )
+
+        def _tool_offer_error(tool_name: str) -> str | None:
+            if tool_exposure_manager is None:
+                return None
+            if tool_name not in offered_tool_names:
+                return (
+                    f"Tool '{tool_name}' was not offered in this model step. "
+                    "Use tool_search and call an activated result on the next step."
+                )
+            return tool_exposure_manager.validate_call(
+                tool_name,
+                offered_mcp_generations.get(tool_name),
+                offered_tools_by_name.get(tool_name),
+            )
+
         cache_fingerprint = build_cache_fingerprint(
             messages=messages,
             tools=tool_list,
@@ -3663,7 +3590,6 @@ async def run_agent_loop(
                     except Exception:
                         _log.debug("failed to close repetitive LLM stream", exc_info=True)
                 _cleanup_incomplete_messages(messages)
-                _compact_pending_tool_call_history()
                 _log.warning(
                     "repetitive_llm_stream_aborted: pattern=%r text_len=%d thinking_len=%d",
                     stream_repeat_pattern,
@@ -3683,14 +3609,12 @@ async def run_agent_loop(
 
             if cancelled():
                 _cleanup_incomplete_messages(messages)
-                _compact_pending_tool_call_history()
                 if hook_mgr.hooks:
                     await hook_mgr.fire_done(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
                 yield DoneEvent(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
                 return
 
             if finish_event is None:
-                _compact_pending_tool_call_history()
                 msg = "LLM stream ended without a finish event"
                 if hook_mgr.hooks:
                     await hook_mgr.fire_error(message=msg, is_fatal=True, exception=None)
@@ -3713,11 +3637,6 @@ async def run_agent_loop(
                 oversized_tool_calls=finish_event.oversized_tool_calls,
             )
             provider_request_id = finish_event.provider_request_id
-            # The request that just completed saw the previous large tool-call
-            # arguments in full. Compact them now so only one subsequent model
-            # turn pays that context cost and later turns cannot immediately
-            # echo a synthetic placeholder as the next file chunk.
-            _compact_pending_tool_call_history()
             yield LLMOutputEvent(
                 step=step + 1,
                 content=response.content,
@@ -3732,9 +3651,6 @@ async def run_agent_loop(
             from .llm.error_messages import classify_llm_error, extract_llm_error_code
             from .retry import StreamInterrupted
 
-            # The provider request was attempted with the pending arguments in
-            # full. Do not retain them indefinitely when the request fails.
-            _compact_pending_tool_call_history()
             provider_request_id = None
             if isinstance(exc, StreamInterrupted):
                 partial_text = exc.partial_text or ""
@@ -3869,8 +3785,8 @@ async def run_agent_loop(
                     recovery_text = (
                         "模型服务在上一轮已经输出部分内容、但尚未完成动作时长时间没有返回"
                         "新数据。请从未完成的动作继续，不要重复已经输出的说明，也不要把"
-                        "说明误当成任务完成。若要生成长文件，请使用 staged_file_write，"
-                        "每个 append_text 不超过 "
+                        "说明误当成任务完成。若要生成长文件，请使用 write_file 的"
+                        "chunk_index/final 分块协议，每块建议不超过 "
                         f"{RECOMMENDED_GENERATED_BODY_CHARS:,} 字符；bash 只传短命令。"
                     )
                     messages.append(
@@ -3934,10 +3850,11 @@ async def run_agent_loop(
                 repair_text = (
                     "上一轮工具参数在流式生成阶段超过安全预算，工具没有执行。"
                     f"超限信息：{rendered}。不要重新生成相同的大参数，也不要提高 token "
-                    "预算。bash 只执行短命令；预计超过 8,000 字符的文本文件必须使用 "
-                    "staged_file_write：begin 后用不超过 "
-                    f"{RECOMMENDED_GENERATED_BODY_CHARS:,} 字符的 append_text 分块，"
-                    "需要复用本地文本时用 append_file，最后 commit 并校验文件。"
+                    "预算。bash 只执行短命令；长文本文件请使用 write_file 的有序分块。"
+                    "同一路径已有成功分块时，从最近一次结果返回的 next_chunk_index 继续；"
+                    "只有尚无已接受分块时才使用 chunk_index=0。每块建议不超过 "
+                    f"{RECOMMENDED_GENERATED_BODY_CHARS:,} 字符，最后一块设置 final=true，"
+                    "然后校验文件。"
                 )
                 messages.append(
                     Message(role="user", content=format_injected_message(repair_text))
@@ -3979,41 +3896,103 @@ async def run_agent_loop(
             return
 
         # ── Output truncated by provider token limit ────────
-        # finish_reason="length" splits into four cases, distinguished by
-        # (a) whether visible text was already streamed to the host and
-        # (b) whether the tool_call arguments came back parseable:
-        #
-        #   1. NO visible text + broken tool_call + stream_dropped_mid_tool →
-        #      SSE stream died mid tool-call (network / peer close). Boosting
-        #      max_tokens is pointless. SAME-messages retry is safe because
-        #      nothing user-visible was emitted.
-        #   2. NO visible text + broken tool_call + upstream said "length" →
-        #      genuine output-cap on tool_call JSON. Boost max_tokens and
-        #      SAME-messages retry. Still safe: no double-render.
-        #   3. Visible text present (with or without broken tool_call) →
-        #      the host has already rendered the partial via ContentEvent.
-        #      SAME-messages retry would re-stream the SAME (or similar) text
-        #      and the user sees it twice. Instead: append the partial as
-        #      an assistant turn and hand off to the truncation_continuation
-        #      machinery — the next LLM call CONTINUES the reply rather than
-        #      restarting it.
-        #   4. No tool_calls, no visible text, but finish_reason="length" →
-        #      degenerate case (model spent tokens on hidden thinking or the
-        #      relay lied). SAME-messages retry with a boost.
-        #
-        # Only after the retry / continuation budget is exhausted do we
-        # surface a user-visible error.
+        # The finish reason, not best-effort JSON parseability, determines
+        # whether a response is complete enough to execute. A parseable tool
+        # call that arrived with length/max_tokens is still only a discarded
+        # attempt. Both parseable and broken attempts receive the same hidden
+        # user recovery instruction and no tool result, because no ToolCall
+        # was admitted into executable conversation history.
         if response.finish_reason in ("length", "max_tokens"):
             stream_dropped = getattr(response, "stream_dropped_mid_tool", False)
             has_broken_tool_call = bool(response.truncated_tool_calls)
             visible_text = (response.content or "").strip()
+            parsed_tool_names = {
+                tool_call.function.name
+                for tool_call in (response.tool_calls or [])
+                if tool_call.function.name
+            }
+            truncated_tool_names = {
+                str(item.get("name"))
+                for item in (response.truncated_tool_calls or [])
+                if item.get("name")
+            }
+            tool_names = parsed_tool_names | truncated_tool_names
+            has_tool_attempt = bool(
+                response.tool_calls or response.truncated_tool_calls
+            )
 
-            # Case 3: visible text already streamed. SAME-messages retry is
-            # NOT safe — it would double-render. Delegate to the continuation
-            # path: keep the partial assistant turn and inject a "continue
-            # from the tail" nudge. This is the same shape the normal
-            # suspected-truncation branch uses (see below), reused here for
-            # the honest "length" finish.
+            if has_tool_attempt:
+                if visible_text:
+                    messages.append(
+                        Message(
+                            role="assistant",
+                            content=response.content,
+                            thinking=response.thinking,
+                        )
+                    )
+                if truncated_tool_call_retries < max_truncated_tool_call_retries:
+                    truncated_tool_call_retries += 1
+                    repair_text = (
+                        _OUTPUT_LENGTH_WRITE_FILE_RECOVERY
+                        if "write_file" in tool_names
+                        else _OUTPUT_LENGTH_TOOL_RECOVERY
+                    )
+                    messages.append(
+                        Message(
+                            role="user",
+                            content=format_injected_message(repair_text),
+                        )
+                    )
+                    yield InjectedMessageEvent(
+                        content=repair_text,
+                        injection_id=None,
+                        user_visible=False,
+                    )
+                    _log.warning(
+                        "discarded output-length tool attempt %d/%d: tools=%s "
+                        "parseable=%s broken=%s stream_dropped=%s request_id=%s",
+                        truncated_tool_call_retries,
+                        max_truncated_tool_call_retries,
+                        sorted(tool_names),
+                        bool(response.tool_calls),
+                        has_broken_tool_call,
+                        stream_dropped,
+                        provider_request_id,
+                    )
+                    elapsed = perf_counter() - step_start
+                    total = perf_counter() - run_start
+                    if hook_mgr.hooks:
+                        await hook_mgr.fire_step_end(
+                            step=step + 1,
+                            elapsed_seconds=elapsed,
+                            total_elapsed_seconds=total,
+                        )
+                    yield StepEnd(
+                        step=step + 1,
+                        elapsed_seconds=elapsed,
+                        total_elapsed_seconds=total,
+                    )
+                    continue
+
+                msg = "工具调用因输出长度限制未执行；分块重试仍未完成。"
+                _log.error(
+                    "output-length tool recovery exhausted: tools=%s request_id=%s",
+                    sorted(tool_names),
+                    provider_request_id,
+                )
+                _cleanup_incomplete_messages(messages)
+                if hook_mgr.hooks:
+                    await hook_mgr.fire_error(message=msg, is_fatal=True, exception=None)
+                    await hook_mgr.fire_done(
+                        stop_reason=StopReason.MAX_TOKENS,
+                        final_content=msg,
+                    )
+                yield ErrorEvent(message=msg, is_fatal=True)
+                yield DoneEvent(stop_reason=StopReason.MAX_TOKENS, final_content=msg)
+                return
+
+            # No tool attempt: preserve the existing text continuation and
+            # empty-response retry behavior.
             if visible_text and truncation_continuations < max_truncation_continuations:
                 messages.append(assistant_msg)
                 truncation_continuations += 1
@@ -4049,8 +4028,6 @@ async def run_agent_loop(
                 )
                 continue
 
-            # Cases 1/2/4: no visible text was streamed, so re-issuing the
-            # SAME messages does not double-render anything.
             if (
                 not visible_text
                 and truncated_tool_call_retries < max_truncated_tool_call_retries
@@ -4088,7 +4065,7 @@ async def run_agent_loop(
                 )
                 continue
 
-            # Retries / continuations exhausted — persist what we have and
+            # Retries / continuations exhausted — persist plain text and
             # surface the error.
             messages.append(assistant_msg)
             usage = response.usage
@@ -4131,8 +4108,6 @@ async def run_agent_loop(
 
         # ── Append assistant message (non-truncated path) ───
         messages.append(assistant_msg)
-        if _tool_calls_need_model_history_compaction(assistant_msg.tool_calls):
-            pending_history_compaction = assistant_msg
 
         # Reset the retry counter now that a clean turn landed — a future
         # truncation on a later step should get its own fresh budget.
@@ -4477,7 +4452,6 @@ async def run_agent_loop(
         # ── Cancellation check (before tools) ──────────────
         if cancelled():
             _cleanup_incomplete_messages(messages)
-            _compact_pending_tool_call_history()
             if hook_mgr.hooks:
                 await hook_mgr.fire_done(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
             yield DoneEvent(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
@@ -4561,7 +4535,9 @@ async def run_agent_loop(
                 # sequential branch even if a future mutation tool is marked
                 # parallel-safe.
                 regular_calls.append(tc)
-            elif fn_name in tools and getattr(tools[fn_name], "parallel_safe", False):
+            elif fn_name in offered_tools_by_name and getattr(
+                offered_tools_by_name[fn_name], "parallel_safe", False
+            ):
                 parallel_calls.append(tc)
             else:
                 regular_calls.append(tc)
@@ -4755,7 +4731,12 @@ async def run_agent_loop(
                 artifact_root_dir,
             )
 
-            if browser_intent_error is not None:
+            offered_error = _tool_offer_error(fn_name)
+
+            if offered_error is not None:
+                allowed_to_execute = False
+                internal_skip_error = offered_error
+            elif browser_intent_error is not None:
                 allowed_to_execute = False
                 internal_skip_error = browser_intent_error
             elif placeholder_argument is not None:
@@ -4834,11 +4815,14 @@ async def run_agent_loop(
             if tool_user_visible and fn_name not in FINAL_SUMMARY_EXCLUDED_TOOLS:
                 visible_tool_call_total += 1
 
+            tool_id, server_name = _tool_target_identity(fn_name)
             yield ToolCallStart(
                 tool_call_id=tc_id,
                 tool_name=fn_name,
                 arguments=fn_args,
                 user_visible=tool_user_visible,
+                tool_id=tool_id,
+                server_name=server_name,
             )
 
             # Hook: tool start (interceptor — may modify arguments)
@@ -4854,6 +4838,8 @@ async def run_agent_loop(
                 tool_call_id=tc_id,
                 data={
                     "tool_name": fn_name,
+                    "tool_id": tool_id,
+                    "server_name": server_name,
                     "arguments": fn_args,
                     "allowed_to_execute": allowed_to_execute,
                     "user_visible": tool_user_visible,
@@ -4867,10 +4853,14 @@ async def run_agent_loop(
 
             if not allowed_to_execute:
                 result = ToolResult(success=False, content="", error=internal_skip_error or "")
-            elif fn_name not in tools:
+            elif fn_name not in offered_tools_by_name:
                 result = ToolResult(success=False, content="", error=f"Unknown tool: {fn_name}")
+            elif (
+                current_offer_error := _tool_offer_error(fn_name)
+            ):
+                result = ToolResult(success=False, content="", error=current_offer_error)
             else:
-                tool = tools[fn_name]
+                tool = offered_tools_by_name[fn_name]
                 if isinstance(tool, EventEmittingTool):
                     # Wire queue, run in background, drain in foreground
                     event_queue: asyncio.Queue = asyncio.Queue()
@@ -4881,10 +4871,12 @@ async def run_agent_loop(
                     async def _seq_exec(t=tool, a=fn_args):
                         nonlocal exec_result
                         try:
-                            exec_result = await t.execute_with_event_context(
-                                event_queue=event_queue,
-                                parent_tool_call_id=tc_id,
-                                **a,
+                            exec_result = await t.invoke(
+                                a,
+                                context=ToolInvocationContext(
+                                    event_queue=event_queue,
+                                    parent_tool_call_id=tc_id,
+                                ),
                             )
                         except Exception as exc:
                             detail = f"{type(exc).__name__}: {exc!s}"
@@ -4948,8 +4940,11 @@ async def run_agent_loop(
                         await exec_task
                         result = exec_result  # type: ignore[assignment]
                 else:
-                    exec_task = asyncio.create_task(tools[fn_name].execute(**fn_args))
+                    exec_task: asyncio.Task[ToolResult] | None = None
                     try:
+                        exec_task = asyncio.create_task(
+                            offered_tools_by_name[fn_name].invoke(fn_args)
+                        )
                         while True:
                             done, _ = await asyncio.wait(
                                 {exec_task}, timeout=TOOL_ACTIVITY_INTERVAL_SECONDS
@@ -4976,7 +4971,7 @@ async def run_agent_loop(
                             error=f"Tool execution failed: {detail}\n\nTraceback:\n{trace}",
                         )
                     finally:
-                        if not exec_task.done():
+                        if exec_task is not None and not exec_task.done():
                             exec_task.cancel()
                             try:
                                 await exec_task
@@ -5004,6 +4999,8 @@ async def run_agent_loop(
                     result_content=result.content if result.success else None,
                     result_error=result.error if not result.success else None,
                     raw_output=result.raw_output,
+                    tool_id=tool_id,
+                    server_name=server_name,
                 )
 
             # ── Permission negotiation + retry ──────────────
@@ -5035,17 +5032,32 @@ async def run_agent_loop(
                         decision="approved",
                         retry_count=1,
                     )
-                    _approve_tool_permission(tools[fn_name], result.permission_request)
-                    try:
-                        result = await tools[fn_name].execute(**fn_args)
-                    except Exception as exc:
-                        detail = f"{type(exc).__name__}: {exc!s}"
-                        trace = traceback.format_exc()
+                    retry_offer_error = (
+                        f"Unknown tool: {fn_name}"
+                        if fn_name not in offered_tools_by_name
+                        else _tool_offer_error(fn_name)
+                    )
+                    if retry_offer_error is not None:
                         result = ToolResult(
                             success=False,
                             content="",
-                            error=f"Tool execution failed: {detail}\n\nTraceback:\n{trace}",
+                            error=retry_offer_error,
                         )
+                    else:
+                        _approve_tool_permission(
+                            offered_tools_by_name[fn_name],
+                            result.permission_request,
+                        )
+                        try:
+                            result = await offered_tools_by_name[fn_name].invoke(fn_args)
+                        except Exception as exc:
+                            detail = f"{type(exc).__name__}: {exc!s}"
+                            trace = traceback.format_exc()
+                            result = ToolResult(
+                                success=False,
+                                content="",
+                                error=f"Tool execution failed: {detail}\n\nTraceback:\n{trace}",
+                            )
                     # Re-log after retry
                     if logger:
                         logger.log_tool_result(
@@ -5055,6 +5067,8 @@ async def run_agent_loop(
                             result_content=result.content if result.success else None,
                             result_error=result.error if not result.success else None,
                             raw_output=result.raw_output,
+                            tool_id=tool_id,
+                            server_name=server_name,
                         )
                 elif policy_decision is not None and policy_decision.get("decision") != "error":
                     policy_decision = _policy_decision_payload(
@@ -5152,7 +5166,16 @@ async def run_agent_loop(
                 and workflow_policy.is_direct_evidence_read_tool(fn_name)
                 and (result.model_context or result.content or "").strip()
             ):
-                direct_url = _first_present(fn_args, ("url", "URL", "href"))
+                direct_evidence_url = getattr(
+                    workflow_policy,
+                    "direct_evidence_url",
+                    None,
+                )
+                direct_url = (
+                    direct_evidence_url(fn_name, fn_args, result)
+                    if callable(direct_evidence_url)
+                    else _first_present(fn_args, ("url", "URL", "href"))
+                )
                 normalized_direct_url = _normalize_search_url(direct_url)
                 if normalized_direct_url:
                     verified_evidence_urls.add(normalized_direct_url)
@@ -5210,6 +5233,8 @@ async def run_agent_loop(
                 tool_call_id=tc_id,
                 data={
                     "tool_name": fn_name,
+                    "tool_id": tool_id,
+                    "server_name": server_name,
                     "success": result.success,
                     "content": tc_content,
                     "error": tc_error,
@@ -5230,6 +5255,8 @@ async def run_agent_loop(
                 raw_output=result.raw_output,
                 user_visible=tool_user_visible,
                 policy_decision=policy_decision,
+                tool_id=tool_id,
+                server_name=server_name,
             )
             if result.success and tool_user_visible:
                 web_search_payload = _extract_web_search_payload(fn_name, tc_content)
@@ -5262,7 +5289,6 @@ async def run_agent_loop(
             # Cancellation check after each tool
             if cancelled():
                 _cleanup_incomplete_messages(messages)
-                _compact_pending_tool_call_history()
                 if hook_mgr.hooks:
                     await hook_mgr.fire_done(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
                 yield DoneEvent(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
@@ -5298,6 +5324,7 @@ async def run_agent_loop(
                     tc.function.name,
                     par_fn_args,
                 )
+                offered_error = _tool_offer_error(tc.function.name)
                 placeholder_recovery_error = _model_history_placeholder_recovery_error(
                     pending_model_history_recovery,
                     tc.function.name,
@@ -5305,7 +5332,10 @@ async def run_agent_loop(
                     workspace_dir,
                     artifact_root_dir,
                 )
-                if browser_intent_error is not None:
+                if offered_error is not None:
+                    allowed_to_execute = False
+                    internal_skip_error = offered_error
+                elif browser_intent_error is not None:
                     allowed_to_execute = False
                     internal_skip_error = browser_intent_error
                 elif placeholder_recovery_error is not None:
@@ -5350,11 +5380,14 @@ async def run_agent_loop(
                 par_user_visible[tc.id] = allowed_to_execute
                 if allowed_to_execute and tc.function.name not in FINAL_SUMMARY_EXCLUDED_TOOLS:
                     visible_tool_call_total += 1
+                tool_id, server_name = _tool_target_identity(tc.function.name)
                 yield ToolCallStart(
                     tool_call_id=tc.id,
                     tool_name=tc.function.name,
                     arguments=par_fn_args,
                     user_visible=allowed_to_execute,
+                    tool_id=tool_id,
+                    server_name=server_name,
                 )
                 if hook_mgr.hooks and allowed_to_execute:
                     par_fn_args = await hook_mgr.fire_tool_start(
@@ -5369,6 +5402,8 @@ async def run_agent_loop(
                     tool_call_id=tc.id,
                     data={
                         "tool_name": tc.function.name,
+                        "tool_id": tool_id,
+                        "server_name": server_name,
                         "arguments": par_fn_args,
                         "allowed_to_execute": allowed_to_execute,
                         "user_visible": allowed_to_execute,
@@ -5394,19 +5429,28 @@ async def run_agent_loop(
                 fn_args = par_args_map[tc.id]
                 if tc.id in par_budget_errors:
                     return tc, ToolResult(success=False, content="", error=par_budget_errors[tc.id])
-                if fn_name not in tools:
+                if fn_name not in offered_tools_by_name:
                     return tc, ToolResult(success=False, content="", error=f"Unknown tool: {fn_name}")
+                current_offer_error = _tool_offer_error(fn_name)
+                if current_offer_error is not None:
+                    return tc, ToolResult(
+                        success=False,
+                        content="",
+                        error=current_offer_error,
+                    )
                 try:
                     async with par_semaphore:
-                        tool = tools[fn_name]
+                        tool = offered_tools_by_name[fn_name]
                         if isinstance(tool, EventEmittingTool):
-                            r = await tool.execute_with_event_context(
-                                event_queue=par_event_queue,
-                                parent_tool_call_id=tc.id,
-                                **fn_args,
+                            r = await tool.invoke(
+                                fn_args,
+                                context=ToolInvocationContext(
+                                    event_queue=par_event_queue,
+                                    parent_tool_call_id=tc.id,
+                                ),
                             )
                         else:
-                            r = await tool.execute(**fn_args)
+                            r = await tool.invoke(fn_args)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -5564,6 +5608,7 @@ async def run_agent_loop(
                 tc_id = tc.id
                 fn_name = tc.function.name
                 fn_args = par_args_map[tc_id]
+                tool_id, server_name = _tool_target_identity(fn_name)
                 tool_user_visible = par_user_visible.get(tc_id, True)
                 policy_decision: dict[str, Any] | None = None
 
@@ -5586,6 +5631,8 @@ async def run_agent_loop(
                         result_content=result.content if result.success else None,
                         result_error=result.error if not result.success else None,
                         raw_output=result.raw_output,
+                        tool_id=tool_id,
+                        server_name=server_name,
                     )
 
                 # ── Permission negotiation + retry ──────────────
@@ -5617,17 +5664,32 @@ async def run_agent_loop(
                             decision="approved",
                             retry_count=1,
                         )
-                        _approve_tool_permission(tools[fn_name], result.permission_request)
-                        try:
-                            result = await tools[fn_name].execute(**fn_args)
-                        except Exception as exc:
-                            detail = f"{type(exc).__name__}: {exc!s}"
-                            trace = traceback.format_exc()
+                        retry_offer_error = (
+                            f"Unknown tool: {fn_name}"
+                            if fn_name not in offered_tools_by_name
+                            else _tool_offer_error(fn_name)
+                        )
+                        if retry_offer_error is not None:
                             result = ToolResult(
                                 success=False,
                                 content="",
-                                error=f"Tool execution failed: {detail}\n\nTraceback:\n{trace}",
+                                error=retry_offer_error,
                             )
+                        else:
+                            _approve_tool_permission(
+                                offered_tools_by_name[fn_name],
+                                result.permission_request,
+                            )
+                            try:
+                                result = await offered_tools_by_name[fn_name].invoke(fn_args)
+                            except Exception as exc:
+                                detail = f"{type(exc).__name__}: {exc!s}"
+                                trace = traceback.format_exc()
+                                result = ToolResult(
+                                    success=False,
+                                    content="",
+                                    error=f"Tool execution failed: {detail}\n\nTraceback:\n{trace}",
+                                )
                         if logger:
                             logger.log_tool_result(
                                 tool_name=fn_name,
@@ -5636,6 +5698,8 @@ async def run_agent_loop(
                                 result_content=result.content if result.success else None,
                                 result_error=result.error if not result.success else None,
                                 raw_output=result.raw_output,
+                                tool_id=tool_id,
+                                server_name=server_name,
                             )
                     elif policy_decision is not None and policy_decision.get("decision") != "error":
                         policy_decision = _policy_decision_payload(
@@ -5723,7 +5787,16 @@ async def run_agent_loop(
                     and workflow_policy.is_direct_evidence_read_tool(fn_name)
                     and (result.model_context or result.content or "").strip()
                 ):
-                    direct_url = _first_present(par_fn_args, ("url", "URL", "href"))
+                    direct_evidence_url = getattr(
+                        workflow_policy,
+                        "direct_evidence_url",
+                        None,
+                    )
+                    direct_url = (
+                        direct_evidence_url(fn_name, par_fn_args, result)
+                        if callable(direct_evidence_url)
+                        else _first_present(par_fn_args, ("url", "URL", "href"))
+                    )
                     normalized_direct_url = _normalize_search_url(direct_url)
                     if normalized_direct_url:
                         verified_evidence_urls.add(normalized_direct_url)
@@ -5782,6 +5855,8 @@ async def run_agent_loop(
                     tool_call_id=tc_id,
                     data={
                         "tool_name": fn_name,
+                        "tool_id": tool_id,
+                        "server_name": server_name,
                         "success": result.success,
                         "content": par_content,
                         "error": par_error,
@@ -5806,6 +5881,8 @@ async def run_agent_loop(
                     raw_output=result.raw_output,
                     user_visible=tool_user_visible,
                     policy_decision=policy_decision,
+                    tool_id=tool_id,
+                    server_name=server_name,
                 )
                 if result.success and tool_user_visible:
                     web_search_payload = _extract_web_search_payload(fn_name, par_content)
@@ -5850,7 +5927,6 @@ async def run_agent_loop(
             # protocol-valid state for the next turn.
             if cancelled():
                 _cleanup_incomplete_messages(messages)
-                _compact_pending_tool_call_history()
                 if hook_mgr.hooks:
                     await hook_mgr.fire_done(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
                 yield DoneEvent(stop_reason=StopReason.CANCELLED, final_content="Task cancelled by user.")
@@ -5885,11 +5961,14 @@ async def run_agent_loop(
                     f"call {source_id} did not produce a result."
                 )
 
+            tool_id, server_name = _tool_target_identity(tc.function.name)
             yield ToolCallStart(
                 tool_call_id=tc.id,
                 tool_name=tc.function.name,
                 arguments=tc.function.arguments,
                 user_visible=False,
+                tool_id=tool_id,
+                server_name=server_name,
             )
             emit_session_trace(
                 "tool.request",
@@ -5898,6 +5977,8 @@ async def run_agent_loop(
                 tool_call_id=tc.id,
                 data={
                     "tool_name": tc.function.name,
+                    "tool_id": tool_id,
+                    "server_name": server_name,
                     "arguments": tc.function.arguments,
                     "allowed_to_execute": False,
                     "user_visible": False,
@@ -5919,6 +6000,8 @@ async def run_agent_loop(
                 tool_call_id=tc.id,
                 data={
                     "tool_name": tc.function.name,
+                    "tool_id": tool_id,
+                    "server_name": server_name,
                     "success": source_succeeded is True,
                     "content": duplicate_content,
                     "error": duplicate_error,
@@ -5942,6 +6025,8 @@ async def run_agent_loop(
                 raw_output=None,
                 user_visible=False,
                 policy_decision=None,
+                tool_id=tool_id,
+                server_name=server_name,
             )
 
         if model_history_placeholder_auto_repair_requested:
@@ -5961,7 +6046,6 @@ async def run_agent_loop(
             )
 
         if plan_approval_gate_completed:
-            _compact_pending_tool_call_history()
             elapsed = perf_counter() - step_start
             total = perf_counter() - run_start
             if hook_mgr.hooks:
@@ -6077,7 +6161,6 @@ async def run_agent_loop(
             )
 
     # ── Max steps exhausted ─────────────────────────────────
-    _compact_pending_tool_call_history()
     msg = f"Task couldn't be completed after {max_steps} steps."
     if memory_extractor:
         asyncio.create_task(

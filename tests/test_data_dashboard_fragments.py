@@ -16,10 +16,13 @@ SKILL_INSTRUCTIONS = SKILL_DIR / "SKILL.md"
 NODE = os.environ.get("BOX_AGENT_NODE") or shutil.which("node")
 
 
-def test_dashboard_skill_routes_large_html_to_staged_writer() -> None:
+def test_dashboard_skill_routes_large_html_to_write_file_chunks() -> None:
     instructions = SKILL_INSTRUCTIONS.read_text(encoding="utf-8")
 
-    assert "staged_file_write" in instructions
+    assert "write_file" in instructions
+    assert "chunk_index=0, final=false" in instructions
+    assert "staged_file_write" not in instructions
+    assert "expected_chunks" not in instructions
     assert "禁止把整份 HTML" in instructions
     assert "禁止用 `bash` heredoc" in instructions
 

@@ -67,6 +67,13 @@ class WorkflowPolicy(Protocol):
 
     def is_direct_evidence_read_tool(self, tool_name: str) -> bool: ...
 
+    def direct_evidence_url(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: ToolResult,
+    ) -> str | None: ...
+
     def allows_completion_continuation(self) -> bool: ...
 
     def suppresses_generic_final_summary(self) -> bool: ...

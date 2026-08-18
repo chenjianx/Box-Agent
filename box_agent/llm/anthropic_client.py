@@ -564,7 +564,7 @@ class AnthropicClient(LLMClientBase):
                                         },
                                     )
                                 limit = streamed_argument_limit(current_tool_name)
-                                if arguments_len > limit:
+                                if limit is not None and arguments_len > limit:
                                     oversized_info.append(
                                         {
                                             "name": current_tool_name or "",

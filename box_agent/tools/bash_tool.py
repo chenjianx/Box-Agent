@@ -1215,6 +1215,7 @@ Examples:
                 },
             },
             "required": ["command"],
+            "additionalProperties": False,
         }
 
     async def execute(
@@ -1240,7 +1241,7 @@ Examples:
                     "BASH_ARGUMENT_TOO_LARGE: bash.command is "
                     f"{len(command)} characters; limit is {MAX_BASH_COMMAND_CHARS}. "
                     "Do not put generated file bodies, heredocs, or base64 payloads in bash. "
-                    "Use staged_file_write for large text artifacts."
+                    "Use ordered write_file chunks for large text artifacts."
                 )
                 return BashOutputResult(
                     success=False,

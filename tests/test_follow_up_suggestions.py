@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -48,9 +49,11 @@ class _FollowUpLLM:
 class _DedicatedFollowUpLLM:
     def __init__(self) -> None:
         self.generate_calls = []
+        self.release_suggestions = asyncio.Event()
 
     async def generate(self, messages, tools=None, **_):
         self.generate_calls.append(_)
+        await self.release_suggestions.wait()
         return LLMResponse(
             content='{"suggestions":["核对项目当前的 React 版本", "查看 React 19.2 的新增内容"]}',
             finish_reason="stop",
@@ -194,7 +197,7 @@ async def test_acp_strips_model_metadata_across_activity_and_emits_suggestions(t
 
 
 @pytest.mark.asyncio
-async def test_acp_generates_suggestions_in_a_dedicated_lightweight_call(tmp_path) -> None:
+async def test_acp_generates_suggestions_in_background_without_blocking_prompt(tmp_path) -> None:
     conn = _RecordingConn()
     llm = _DedicatedFollowUpLLM()
     agent = BoxACPAgent(
@@ -228,6 +231,18 @@ async def test_acp_generates_suggestions_in_a_dedicated_lightweight_call(tmp_pat
     )
 
     assert response.stopReason == "end_turn"
+    suggestion_task = agent._sessions[session.sessionId].follow_up_suggestions_task
+    assert suggestion_task is not None
+    assert not suggestion_task.done()
+    assert not any(
+        getattr(update.update, "sessionUpdate", None) == "tool_call_update"
+        and isinstance(getattr(update.update, "rawOutput", None), dict)
+        and update.update.rawOutput.get("type") == "follow_up_suggestions"
+        for update in conn.updates
+    )
+
+    llm.release_suggestions.set()
+    await suggestion_task
     suggestion_updates = [
         update.update.rawOutput
         for update in conn.updates
@@ -238,12 +253,70 @@ async def test_acp_generates_suggestions_in_a_dedicated_lightweight_call(tmp_pat
     assert suggestion_updates == [
         {
             "type": "follow_up_suggestions",
+            "turn_id": "office-turn-1",
             "suggestions": ["核对项目当前的 React 版本", "查看 React 19.2 的新增内容"],
         }
     ]
     assert llm.generate_calls[-1]["session_id"] == "office-session-1"
     assert llm.generate_calls[-1]["turn_id"] == "office-turn-1"
     assert llm.generate_calls[-1]["title"] == "React 版本查询"
+
+
+@pytest.mark.asyncio
+async def test_acp_cancels_stale_background_suggestions_when_next_turn_starts(tmp_path) -> None:
+    conn = _RecordingConn()
+    llm = _DedicatedFollowUpLLM()
+    agent = BoxACPAgent(
+        conn,
+        Config(
+            llm=LLMConfig(api_key="test-key"),
+            agent=AgentConfig(max_steps=2, workspace_dir=str(tmp_path)),
+            tools=ToolsConfig(),
+        ),
+        llm,
+        [],
+        "system",
+    )
+    session = await agent.newSession(
+        SimpleNamespace(
+            cwd=str(tmp_path),
+            field_meta={"follow_up_suggestions": True, "session_id": "office-session-1"},
+        )
+    )
+
+    await agent.prompt(
+        SimpleNamespace(
+            sessionId=session.sessionId,
+            prompt=[{"text": "第一轮"}],
+            field_meta={"turn_id": "office-turn-1"},
+        )
+    )
+    first_task = agent._sessions[session.sessionId].follow_up_suggestions_task
+    assert first_task is not None
+
+    await agent.prompt(
+        SimpleNamespace(
+            sessionId=session.sessionId,
+            prompt=[{"text": "第二轮"}],
+            field_meta={"turn_id": "office-turn-2"},
+        )
+    )
+    second_task = agent._sessions[session.sessionId].follow_up_suggestions_task
+    assert second_task is not None
+    assert second_task is not first_task
+    await asyncio.sleep(0)
+    assert first_task.done()
+
+    llm.release_suggestions.set()
+    await second_task
+    suggestion_outputs = [
+        update.update.rawOutput
+        for update in conn.updates
+        if getattr(update.update, "sessionUpdate", None) == "tool_call_update"
+        and isinstance(getattr(update.update, "rawOutput", None), dict)
+        and update.update.rawOutput.get("type") == "follow_up_suggestions"
+    ]
+    assert [output["turn_id"] for output in suggestion_outputs] == ["office-turn-2"]
 
 
 @pytest.mark.asyncio

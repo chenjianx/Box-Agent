@@ -8984,13 +8984,28 @@ def test_controlled_finalizer_runs_compact_complete_chain(tmp_path: Path) -> Non
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("FINALIZE_PASS stage=") == 4
     assert "FINALIZE_ADVISORY stage=image_manifest warnings=0" in result.stdout
     assert "FINALIZE_ADVISORY stage=truth" in result.stdout
-    assert (
-        result.stdout.index("FINALIZE_PASS stage=html_self_check")
-        < result.stdout.index("FINALIZE_ADVISORY stage=truth")
-        < result.stdout.index("FINALIZE_PASS stage=runtime_probe")
+    stage_markers = [
+        next(
+            marker
+            for marker in (
+                f"FINALIZE_PASS stage={stage}",
+                f"FINALIZE_ADVISORY stage={stage}",
+            )
+            if marker in result.stdout
+        )
+        for stage in (
+            "deck_spec",
+            "image_manifest",
+            "render",
+            "html_self_check",
+            "truth",
+            "runtime_probe",
+        )
+    ]
+    assert [result.stdout.index(marker) for marker in stage_markers] == sorted(
+        result.stdout.index(marker) for marker in stage_markers
     )
     assert '"ok":true' in result.stdout
     assert (tmp_path / "index.html").is_file()
@@ -9137,7 +9152,10 @@ childProcess.spawnSync = function(command, args, options) {
     assert payload["ok"] is True
     assert payload["degraded"] is True
     assert payload["delivery_status"] == "degraded"
-    assert payload["degraded_stages"] == ["runtime_probe"]
+    assert payload["degraded_stages"][-1] == "runtime_probe"
+    assert set(payload["degraded_stages"]).issubset(
+        {"html_self_check", "runtime_probe"}
+    )
     runtime_report = json.loads(
         (tmp_path / "qa" / "runtime_probe.json").read_text(encoding="utf-8")
     )

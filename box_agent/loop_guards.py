@@ -255,6 +255,16 @@ def format_injected_message(text: str) -> str:
     )
 
 
+def format_runtime_context_update(text: str) -> str:
+    """Wrap an authoritative host/runtime state change without impersonating the user."""
+    return (
+        "The host runtime supplied the following internal state update while the current "
+        "task was running. Treat it as authoritative runtime context, not as a user message. "
+        "Use it when continuing the current task, but do not quote this wrapper to the user.\n\n"
+        f"Runtime state update:\n{text}"
+    )
+
+
 # ── Suspected-truncation continuation ────────────────────────────
 #
 # Some upstream models / relay gateways stop a streamed text turn

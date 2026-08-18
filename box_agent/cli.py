@@ -2197,6 +2197,10 @@ async def run_agent(
         max_truncated_tool_call_retries=config.agent.max_truncated_tool_call_retries,
         truncated_tool_call_boost_cap=config.agent.truncated_tool_call_boost_cap,
         context_resource_dedup_enabled=config.agent.context_resource_dedup_enabled,
+        deferred_mcp_loading_enabled=(
+            config.tools.enable_mcp
+            and config.tools.mcp.deferred_loading_enabled
+        ),
     )
 
     restored_goal = _restore_cli_goal(agent, workspace_dir)
@@ -2327,7 +2331,9 @@ async def run_agent(
     if task:
         print(f"\n{Colors.BRIGHT_BLUE}Agent{Colors.RESET} {Colors.DIM}›{Colors.RESET} {Colors.DIM}Executing task...{Colors.RESET}\n")
         # Block on MCP only when user is actually about to run
-        register_mcp_tools(agent.tools, await await_mcp_tools(mcp_task))
+        loaded_mcp_tools = await await_mcp_tools(mcp_task)
+        if not config.tools.mcp.deferred_loading_enabled:
+            register_mcp_tools(agent.tools, loaded_mcp_tools)
         _apply_skill_filter(task)
         completion_gate = _build_cli_completion_gate(task)
         _apply_cli_auto_loaded_skills(completion_gate, task)
@@ -2584,7 +2590,7 @@ async def run_agent(
                         # Find the sandbox status tool and execute it
                         for tool in tools:
                             if isinstance(tool, SandboxStatusTool):
-                                result = await tool.execute()
+                                result = await tool.invoke({})
                                 if result.success:
                                     print(f"\n{Colors.BRIGHT_CYAN}{result.content}{Colors.RESET}\n")
                                 else:
@@ -2659,8 +2665,11 @@ async def run_agent(
                 break
 
             # Run Agent with Esc cancellation support
-            # Ensure background-loaded MCP tools are registered (no-op after first call)
-            register_mcp_tools(agent.tools, await await_mcp_tools(mcp_task))
+            # Finish background MCP discovery. Deferred mode leaves ordinary
+            # MCP tools catalog-only; legacy eager mode registers them here.
+            loaded_mcp_tools = await await_mcp_tools(mcp_task)
+            if not config.tools.mcp.deferred_loading_enabled:
+                register_mcp_tools(agent.tools, loaded_mcp_tools)
             mcp_task = None  # clear so we don't re-await the cached result each turn
 
             print(

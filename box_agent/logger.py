@@ -178,6 +178,8 @@ class AgentLogger:
         result_content: str | None = None,
         result_error: str | None = None,
         raw_output: dict[str, Any] | None = None,
+        tool_id: str | None = None,
+        server_name: str | None = None,
     ):
         """Log tool execution result
 
@@ -188,6 +190,8 @@ class AgentLogger:
             result_content: Result content (on success)
             result_error: Error message (on failure)
             raw_output: Optional structured result payload for host/CLI UIs
+            tool_id: Stable MCP catalog target identifier, when applicable
+            server_name: MCP server owning the target, when applicable
         """
         self.log_index += 1
 
@@ -197,6 +201,10 @@ class AgentLogger:
             "arguments": arguments,
             "success": result_success,
         }
+        if tool_id is not None:
+            tool_result_data["tool_id"] = tool_id
+        if server_name is not None:
+            tool_result_data["server_name"] = server_name
 
         if result_success:
             tool_result_data["result"] = result_content

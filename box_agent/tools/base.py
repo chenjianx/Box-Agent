@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel
+
+from .schema_validation import (
+    ToolArgumentIssue,
+    ToolSchemaValidationError,
+    validate_tool_arguments,
+)
 
 
 class ToolResult(BaseModel):
@@ -18,6 +25,14 @@ class ToolResult(BaseModel):
     raw_output: dict | None = None  # optional structured payload for host UIs
     model_context: str | None = None  # optional compact content for future LLM turns
     state_checkpoint: str | None = None  # optional canonical state for compaction
+
+
+@dataclass(frozen=True, slots=True)
+class ToolInvocationContext:
+    """Optional runtime context hidden behind the tool invocation interface."""
+
+    event_queue: asyncio.Queue | None = None
+    parent_tool_call_id: str = ""
 
 
 class Tool:
@@ -43,6 +58,65 @@ class Tool:
     async def execute(self, *args, **kwargs) -> ToolResult:  # type: ignore
         """Execute the tool with arbitrary arguments."""
         raise NotImplementedError
+
+    async def invoke(
+        self,
+        arguments: dict[str, Any],
+        *,
+        context: ToolInvocationContext | None = None,
+    ) -> ToolResult:
+        """Validate an invocation and execute the tool implementation."""
+
+        try:
+            issues = validate_tool_arguments(self.parameters, arguments)
+        except ToolSchemaValidationError:
+            return self._invalid_schema_result()
+        if issues:
+            return self._invalid_arguments_result(issues)
+        return await self._invoke_validated(arguments, context=context)
+
+    def _invalid_schema_result(self) -> ToolResult:
+        message = "tool parameter schema is invalid"
+        return ToolResult(
+            success=False,
+            error=f"INVALID_TOOL_SCHEMA: {self.name}\n- /: {message}",
+            raw_output={
+                "code": "INVALID_TOOL_SCHEMA",
+                "tool": self.name,
+                "issues": [
+                    {
+                        "path": "/",
+                        "keyword": "schema",
+                        "message": message,
+                    }
+                ],
+            },
+        )
+
+    def _invalid_arguments_result(
+        self,
+        issues: tuple[ToolArgumentIssue, ...],
+    ) -> ToolResult:
+        details = "\n".join(
+            f"- {issue.path}: {issue.message}" for issue in issues
+        )
+        return ToolResult(
+            success=False,
+            error=f"INVALID_TOOL_ARGUMENTS: {self.name}\n{details}",
+            raw_output={
+                "code": "INVALID_TOOL_ARGUMENTS",
+                "tool": self.name,
+                "issues": [issue.to_dict() for issue in issues],
+            },
+        )
+
+    async def _invoke_validated(
+        self,
+        arguments: dict[str, Any],
+        *,
+        context: ToolInvocationContext | None,
+    ) -> ToolResult:
+        return await self.execute(**arguments)
 
     def to_schema(self) -> dict[str, Any]:
         """Convert tool to Anthropic tool schema."""
@@ -99,3 +173,17 @@ class EventEmittingTool(Tool):
         finally:
             self._event_queue = previous_queue
             self._parent_tool_call_id = previous_parent_tool_call_id
+
+    async def _invoke_validated(
+        self,
+        arguments: dict[str, Any],
+        *,
+        context: ToolInvocationContext | None,
+    ) -> ToolResult:
+        if context is not None and context.event_queue is not None:
+            return await self.execute_with_event_context(
+                event_queue=context.event_queue,
+                parent_tool_call_id=context.parent_tool_call_id,
+                **arguments,
+            )
+        return await self.execute(**arguments)

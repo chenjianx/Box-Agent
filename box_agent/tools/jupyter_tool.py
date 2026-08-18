@@ -13,6 +13,7 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -64,6 +65,116 @@ MAX_EXECUTE_CODE_CHARS_DISPLAY = f"{MAX_EXECUTE_CODE_CHARS:,}"
 # User-level directory for packages installed at runtime in frozen mode.
 # Survives across sessions; kept separate from the frozen binary itself.
 RUNTIME_PACKAGES_DIR = Path.home() / ".box-agent" / "runtime-packages"
+
+
+def _kernel_write_guard_setup_code(workspace: Path) -> str:
+    """Build kernel code that confines user writes to artifact/internal roots."""
+    roots = (
+        workspace.resolve(),
+        Path(tempfile.gettempdir()).resolve(),
+        SANDBOX_BASE_DIR.resolve(),
+        RUNTIME_PACKAGES_DIR.resolve(),
+    )
+    encoded_roots = json.dumps([str(root) for root in roots])
+    return f"""
+import os as _box_guard_os
+import sys as _box_guard_sys
+
+if not getattr(_box_guard_sys, "_box_agent_write_guard_installed", False):
+    def _box_agent_path_is_writable(path):
+        try:
+            raw_path = _box_guard_os.fspath(path)
+        except TypeError:
+            return True
+        if isinstance(raw_path, bytes):
+            raw_path = _box_guard_os.fsdecode(raw_path)
+        if not isinstance(raw_path, str):
+            return True
+        resolved = _box_guard_os.path.realpath(_box_guard_os.path.abspath(raw_path))
+        for root in getattr(_box_guard_sys, "_box_agent_write_roots", ()):
+            try:
+                if _box_guard_os.path.commonpath((resolved, root)) == root:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    def _box_agent_require_writable(path):
+        if not _box_agent_path_is_writable(path):
+            raise PermissionError(
+                "EXECUTE_CODE_WRITE_OUTSIDE_ARTIFACT_ROOT: writes are limited to "
+                f"{{getattr(_box_guard_sys, '_box_agent_write_roots', ())}}; "
+                f"rejected {{path!r}}"
+            )
+
+    def _box_agent_write_audit(event, args):
+        if not getattr(_box_guard_sys, "_box_agent_write_guard_enabled", False):
+            return
+        if event == "open" and args:
+            mode = args[1] if len(args) > 1 else None
+            flags = args[2] if len(args) > 2 else 0
+            writes = (
+                isinstance(mode, str) and any(char in mode for char in "wax+")
+            ) or (
+                isinstance(flags, int)
+                and bool(
+                    flags
+                    & (
+                        _box_guard_os.O_WRONLY
+                        | _box_guard_os.O_RDWR
+                        | _box_guard_os.O_CREAT
+                        | _box_guard_os.O_TRUNC
+                        | _box_guard_os.O_APPEND
+                    )
+                )
+            )
+            if writes:
+                _box_agent_require_writable(args[0])
+        elif event in {{
+            "os.mkdir",
+            "os.remove",
+            "os.rmdir",
+            "os.truncate",
+            "os.unlink",
+        }} and args:
+            _box_agent_require_writable(args[0])
+        elif event in {{"os.rename", "os.replace"}} and len(args) >= 2:
+            _box_agent_require_writable(args[0])
+            _box_agent_require_writable(args[1])
+        elif event in {{"shutil.copyfile", "shutil.copymode", "shutil.copystat"}} and len(args) >= 2:
+            _box_agent_require_writable(args[1])
+
+    _box_guard_sys.addaudithook(_box_agent_write_audit)
+    _box_guard_sys._box_agent_write_guard_installed = True
+
+_box_guard_sys._box_agent_write_roots = tuple(
+    _box_guard_os.path.realpath(root) for root in {encoded_roots}
+)
+_box_guard_sys._box_agent_write_guard_enabled = True
+"""
+
+
+_KERNEL_WRITE_GUARD_DISABLE_CODE = """
+import sys as _box_guard_sys
+_box_guard_sys._box_agent_write_guard_enabled = False
+"""
+
+
+def _execute_with_kernel_write_guard(
+    session: "JupyterKernelSession",
+    code: str,
+    timeout: int,
+) -> tuple[str, list[str], Optional[str]]:
+    setup_result = session.execute(
+        _kernel_write_guard_setup_code(session.workspace),
+        timeout=min(timeout, 10),
+    )
+    if setup_result[2] is not None:
+        return setup_result
+    try:
+        return session.execute(code, timeout)
+    finally:
+        session.execute(_KERNEL_WRITE_GUARD_DISABLE_CODE, timeout=5)
 
 # Whitelist of pip package names allowed for on-demand installation in
 # frozen/runtime mode.  Packages NOT in this set are rejected with a clear
@@ -1164,6 +1275,16 @@ class JupyterSandboxTool(Tool):
             return InProcessKernelSession(session_id, workspace)
         return JupyterKernelSession(session_id, workspace, env)
 
+    @staticmethod
+    def _execute_session_code(
+        session: "JupyterKernelSession | InProcessKernelSession",
+        code: str,
+        timeout: int,
+    ) -> tuple[str, list[str], Optional[str]]:
+        if isinstance(session, JupyterKernelSession):
+            return _execute_with_kernel_write_guard(session, code, timeout)
+        return session.execute(code, timeout)
+
     @property
     def name(self) -> str:
         return "execute_code"
@@ -1174,6 +1295,8 @@ class JupyterSandboxTool(Tool):
 
 This tool runs Python code in a **real Jupyter kernel** with its own isolated environment:
 - Variables, functions, classes, imports all persist between calls
+- Reads may use allowed input paths, but durable writes are confined to the active
+  project/artifact root; runtime-managed temporary/internal roots remain available
 - Pre-installed packages: pandas, numpy, matplotlib, seaborn, scikit-learn, requests,
   openpyxl, xlrd, python-docx, pypdf, pdfplumber, reportlab, python-pptx,
   beautifulsoup4, lxml, pillow, pyyaml, python-dateutil, chardet
@@ -1194,8 +1317,8 @@ Best practices:
 - Keep each code argument under {MAX_EXECUTE_CODE_CHARS_DISPLAY} characters
 - Do not inline large generated static artifact bodies (HTML/CSS/JS, shared
   styles, JSON manifests, templates, base64, or file bodies) in execute_code.
-  Use staged_file_write with begin, ordered append_text or append_file chunks,
-  and commit unless Python processing is actually required.
+  Use ordered write_file chunks with chunk_index/final unless Python processing
+  is actually required.
 - Use print() to see intermediate results
 - Never use the bash tool's `pip install` for sandbox packages — bash runs against the
   host Python and the sandbox kernel will not see those packages
@@ -1220,9 +1343,10 @@ Output formats:
                         "generated static content such as HTML/CSS/JS, shared "
                         "styles, JSON manifests, templates, base64, or file "
                         "bodies, do not inline the body in execute_code; use "
-                        "staged_file_write with begin, ordered append_text or "
-                        "append_file chunks, and commit unless Python processing "
-                        "is actually required. "
+                        "ordered write_file chunks using chunk_index/final unless "
+                        "Python processing is actually required. "
+                        "Reads may use allowed input paths, but durable writes "
+                        "are confined to the active project/artifact root. "
                         "Variables and functions from previous calls in the same "
                         "session are available. Use %pip install <pkg> to install "
                         "packages."
@@ -1274,8 +1398,8 @@ Output formats:
                     f"{len(code)} characters; limit is {MAX_EXECUTE_CODE_CHARS}. "
                     "Split the work into multiple execute_code calls because "
                     "kernel state persists. Do not inline large generated static "
-                    "artifact bodies; use staged_file_write with begin, ordered "
-                    "append_text or append_file chunks, and commit."
+                    "artifact bodies; use ordered write_file chunks with "
+                    "chunk_index/final."
                 ),
             )
         if self._looks_like_python_pptx_new_deck(code):
@@ -1364,7 +1488,13 @@ Output formats:
         loop = asyncio.get_event_loop()
         try:
             stdout, images, error = await asyncio.wait_for(
-                loop.run_in_executor(None, session.execute, code, timeout),
+                loop.run_in_executor(
+                    None,
+                    self._execute_session_code,
+                    session,
+                    code,
+                    timeout,
+                ),
                 timeout=_EXEC_TIMEOUT,
             )
 
@@ -1377,7 +1507,13 @@ Output formats:
                     ok, _ = await env.install_packages([pip_name])
                     if ok:
                         stdout, images, error = await asyncio.wait_for(
-                            loop.run_in_executor(None, session.execute, code, timeout),
+                            loop.run_in_executor(
+                                None,
+                                self._execute_session_code,
+                                session,
+                                code,
+                                timeout,
+                            ),
                             timeout=_EXEC_TIMEOUT,
                         )
 

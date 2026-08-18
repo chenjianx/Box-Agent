@@ -23,6 +23,7 @@ _ALLOWED_SERVER_FIELDS = frozenset(
         "execute_timeout",
         "sse_read_timeout",
         "disabled",
+        "alwaysLoad",
     }
 )
 _UPDATE_OPERATORS = frozenset({"args_add", "args_remove", "remove_fields"})
@@ -174,8 +175,12 @@ class McpConfigTool(Tool):
             "add — add or replace a server entry; "
             "remove — delete a server entry; "
             "enable / disable — toggle a server without deleting it. "
-            "This tool only writes the file; the host watches mcp.json and "
-            "applies hot reload automatically (or after box-agent restart)."
+            "The list action reports configuration entries, not connected tools or "
+            "callable schemas; use tool_search for capability discovery. "
+            "This tool only confirms the configuration write, not a live connection. "
+            "The host watches mcp.json and applies hot reload automatically; when "
+            "registration finishes during an active turn, the runtime supplies an "
+            "internal connection-state update (or load after box-agent restart)."
         )
 
     @property
@@ -206,7 +211,9 @@ class McpConfigTool(Tool):
                         "Server config object for 'add', or changes for 'update'. "
                         "For stdio: {command, args?, env?}. "
                         "For URL-based: {url, type?: 'sse'|'http'|'streamable_http', headers?}. "
-                        "Optional: connect_timeout, execute_timeout, sse_read_timeout, disabled. "
+                        "Optional: connect_timeout, execute_timeout, sse_read_timeout, disabled, "
+                        "alwaysLoad. Set alwaysLoad=true only for a small core tool set that must "
+                        "remain directly visible; other MCP tools stay deferred. "
                         "Update also supports args_add, args_remove, and remove_fields string lists."
                     ),
                 },
@@ -235,13 +242,31 @@ class McpConfigTool(Tool):
 
         if action == "list":
             if not servers:
-                return ToolResult(success=True, content=f"No MCP servers configured in {target}")
-            lines = [f"MCP config: {target}", ""]
+                return ToolResult(
+                    success=True,
+                    content=(
+                        f"No MCP servers configured in {target}. This is configuration "
+                        "state, not a connected tool inventory; use tool_search for "
+                        "capability discovery."
+                    ),
+                )
+            lines = [
+                f"MCP config: {target}",
+                "note=Configuration entries only; not proof of connection and not a tool inventory.",
+                "note=Use tool_search to discover connected MCP capabilities.",
+                "",
+            ]
             for sname, scfg in servers.items():
                 disabled = scfg.get("disabled", False)
                 status = "disabled" if disabled else "enabled"
-                conn = scfg.get("url") or scfg.get("command") or "?"
-                lines.append(f"  {sname} [{status}]  {conn}")
+                transport = (
+                    "url"
+                    if scfg.get("url")
+                    else "stdio"
+                    if scfg.get("command")
+                    else "unknown"
+                )
+                lines.append(f"  {sname} [{status}] transport={transport}")
             return ToolResult(success=True, content="\n".join(lines))
 
         if action == "inspect_browser":
@@ -311,7 +336,8 @@ class McpConfigTool(Tool):
                 return ToolResult(success=False, content="", error="'config' object is required for add")
             # Only fields that mcp_loader actually consumes are kept; legacy
             # lazy / keywords are silently dropped because the runtime never
-            # honored them.
+            # honored them. alwaysLoad is the explicit deferred-loading escape
+            # hatch for a deliberately small core tool set.
             entry = {k: v for k, v in config.items() if k in _ALLOWED_SERVER_FIELDS}
             servers[name] = entry
 
@@ -329,7 +355,10 @@ class McpConfigTool(Tool):
             success=True,
             content=(
                 f"Done. {target} updated. "
-                "Host watches this file and applies hot reload automatically; "
-                "if no host is driving reconnects, restart box-agent to load."
+                "This confirms only the configuration write, not an MCP connection. "
+                "The host watches this file and applies hot reload automatically. "
+                "If registration completes during this turn, the runtime will inject "
+                "an internal readiness update; otherwise report the server as pending. "
+                "If no host is driving reconnects, restart box-agent to load."
             ),
         )

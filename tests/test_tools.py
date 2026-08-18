@@ -756,6 +756,36 @@ async def test_write_tool_blocks_pptx_skipcheck_exporter():
 
 
 @pytest.mark.asyncio
+async def test_write_tool_blocks_pptx_bypass_split_across_chunks(tmp_path):
+    target = tmp_path / "export.js"
+    target.write_text("original", encoding="utf-8")
+    tool = WriteTool(workspace_dir=str(tmp_path))
+
+    first = await tool.execute(
+        path="export.js",
+        content="await window.domToPptx.exportTo",
+        chunk_index=0,
+        final=False,
+    )
+    blocked = await tool.execute(
+        path="export.js",
+        content='Pptx([]); require("./dom-to-pptx.bundle.js");',
+        chunk_index=1,
+        final=True,
+    )
+
+    assert first.success is True
+    assert blocked.success is False
+    assert "PPTX HTML self-check bypass blocked" in blocked.error
+    assert target.read_text(encoding="utf-8") == "original"
+
+    recovered = await tool.execute(path="export.js", content="safe replacement")
+
+    assert recovered.success is True
+    assert target.read_text(encoding="utf-8") == "safe replacement"
+
+
+@pytest.mark.asyncio
 async def test_append_tool_allows_theme_css_after_canonical_pptx_comments(tmp_path):
     file_path = tmp_path / "common.css"
     file_path.write_text(

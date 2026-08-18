@@ -1349,6 +1349,142 @@ def test_deep_research_keeps_validating_after_a_successful_direct_page_read(tmp_
     ).exists()
 
 
+def test_playwright_metadata_navigation_waits_for_snapshot_body(tmp_path):
+    policy = ControlledPresentationPolicy(
+        workspace_dir=str(tmp_path),
+        artifact_root_dir=None,
+        research_mode="deep",
+        stage="research",
+        research_search_exhausted=True,
+    )
+    source_url = "https://example.com/report"
+    navigation = ToolResult(
+        success=True,
+        content=(
+            "### Page\n"
+            f"- Page URL: {source_url}\n"
+            "- Page Title: Example report\n"
+            "### Snapshot\n"
+            "- [Snapshot](.playwright-mcp/page.yml)"
+        ),
+    )
+
+    policy.record_tool_result(
+        "browser_navigate",
+        {"url": source_url},
+        navigation,
+    )
+
+    assert policy._research_direct_read_attempts == 0
+    assert policy._research_consecutive_unproductive_direct_reads == 0
+    assert policy._research_pending_playwright_url == source_url
+    assert policy.direct_evidence_url(
+        "browser_navigate",
+        {"url": source_url},
+        navigation,
+    ) is None
+    blocked_navigation = policy.tool_call_error(
+        "browser_navigate",
+        {"url": "https://example.com/other"},
+        verified_evidence_urls=set(),
+    )
+    assert blocked_navigation is not None
+    assert "CONTROLLED_PRESENTATION_RESEARCH_SNAPSHOT_REQUIRED" in blocked_navigation
+    assert (
+        policy.tool_call_error(
+            "browser_snapshot",
+            {},
+            verified_evidence_urls=set(),
+        )
+        is None
+    )
+
+    snapshot = ToolResult(
+        success=True,
+        content="Example report body with a supported factual claim.",
+    )
+    policy.record_tool_result("browser_snapshot", {}, snapshot)
+
+    assert policy._research_pending_playwright_url is None
+    assert policy._research_direct_read_attempts == 1
+    assert policy._research_successful_direct_read_attempts == 1
+    assert policy._research_consecutive_unproductive_direct_reads == 0
+    assert source_url in policy._research_direct_source_text
+    assert policy.direct_evidence_url("browser_snapshot", {}, snapshot) == source_url
+
+
+def test_research_snapshot_requires_a_pending_navigation(tmp_path):
+    policy = ControlledPresentationPolicy(
+        workspace_dir=str(tmp_path),
+        artifact_root_dir=None,
+        research_mode="deep",
+        stage="research",
+        research_search_exhausted=True,
+    )
+
+    blocked = policy.tool_call_error(
+        "browser_snapshot",
+        {},
+        verified_evidence_urls=set(),
+    )
+
+    assert blocked is not None
+    assert "CONTROLLED_PRESENTATION_RESEARCH_NAVIGATION_REQUIRED" in blocked
+
+
+def test_deep_research_falls_back_after_two_empty_playwright_snapshots(tmp_path):
+    policy = ControlledPresentationPolicy(
+        workspace_dir=str(tmp_path),
+        artifact_root_dir=None,
+        research_mode="deep",
+    )
+    checkpoint = policy.build_checkpoint()
+    assert checkpoint is not None
+    policy.update_checkpoint(checkpoint)
+    for index in range(RESEARCH_ROUND_LIMIT):
+        policy.record_tool_result(
+            "web_search",
+            {"query": f"official source {index}"},
+            ToolResult(success=True, content=f"https://example.com/{index}"),
+        )
+        checkpoint = policy.build_checkpoint()
+        assert checkpoint is not None
+        policy.update_checkpoint(checkpoint)
+
+    for index in range(2):
+        source_url = f"https://example.com/report-{index}"
+        policy.record_tool_result(
+            "browser_navigate",
+            {"url": source_url},
+            ToolResult(
+                success=True,
+                content=(
+                    "### Page\n"
+                    f"- Page URL: {source_url}\n"
+                    "- Page Title: Example report\n"
+                    "### Snapshot\n"
+                    f"- [Snapshot](.playwright-mcp/page-{index}.yml)"
+                ),
+            ),
+        )
+        policy.record_tool_result(
+            "browser_snapshot",
+            {},
+            ToolResult(success=True, content=""),
+        )
+        checkpoint = policy.build_checkpoint()
+        assert checkpoint is not None
+        if index == 0:
+            assert f"{CONTROLLED_PRESENTATION_CHECKPOINT_MARKER}research" in checkpoint
+            assert '"fallback":true' not in checkpoint
+
+    assert f"{CONTROLLED_PRESENTATION_CHECKPOINT_MARKER}outline" in checkpoint
+    assert '"fallback":true' in checkpoint
+    assert '"fallback_reason":"direct_source_verification_unavailable"' in checkpoint
+    assert policy._research_direct_read_attempts == 2
+    assert policy._research_consecutive_unproductive_direct_reads == 2
+
+
 def test_deep_research_rejects_homepage_and_falls_back_after_two_empty_reads(
     tmp_path,
 ):
@@ -1757,6 +1893,140 @@ def test_deep_research_without_direct_read_tool_requires_unverified_ledger(
     assert "do not call web_search again" in checkpoint
 
 
+def test_successful_tool_search_does_not_consume_research_rounds(
+    tmp_path,
+):
+    policy = ControlledPresentationPolicy(
+        workspace_dir=str(tmp_path),
+        artifact_root_dir=None,
+        research_mode="deep",
+        available_tool_names=frozenset({"tool_search", "write_file", "bash"}),
+    )
+
+    checkpoint = policy.build_checkpoint()
+    assert checkpoint is not None
+    policy.update_checkpoint(checkpoint)
+    for index in range(RESEARCH_ROUND_LIMIT):
+        policy.record_tool_result(
+            "tool_search",
+            {"query": f"browser_read_page_{index}"},
+            ToolResult(
+                success=True,
+                content=json.dumps(
+                    {
+                        "success": True,
+                        "activated": [{"name": "browser_read_page"}],
+                        "conflicts": [],
+                    }
+                ),
+            ),
+        )
+        checkpoint = policy.build_checkpoint()
+        assert checkpoint is not None
+        policy.update_checkpoint(checkpoint)
+
+    assert policy._research_rounds_without_handoff == 0
+    assert policy._research_tool_attempts == 0
+    assert policy._research_discovery_attempts == RESEARCH_ROUND_LIMIT
+    assert policy.research_search_exhausted is False
+    assert (
+        policy.tool_call_error(
+            "web_search",
+            {"query": "first evidence query"},
+            verified_evidence_urls=set(),
+        )
+        is None
+    )
+    assert "No direct browser read tool is available in this run" not in checkpoint
+
+
+def test_deep_research_counts_empty_tool_search_rounds_and_falls_back(tmp_path):
+    policy = ControlledPresentationPolicy(
+        workspace_dir=str(tmp_path),
+        artifact_root_dir=None,
+        research_mode="deep",
+        available_tool_names=frozenset({"tool_search"}),
+    )
+
+    checkpoint = policy.build_checkpoint()
+    assert checkpoint is not None
+    policy.update_checkpoint(checkpoint)
+    for index in range(RESEARCH_ROUND_LIMIT):
+        policy.record_tool_result(
+            "tool_search",
+            {"query": f"missing capability {index}"},
+            ToolResult(
+                success=True,
+                content=json.dumps(
+                    {
+                        "success": True,
+                        "query": f"missing capability {index}",
+                        "activated": [],
+                        "conflicts": [],
+                        "notice": "No matching MCP tools found.",
+                    }
+                ),
+            ),
+        )
+        checkpoint = policy.build_checkpoint()
+        assert checkpoint is not None
+        policy.update_checkpoint(checkpoint)
+
+    assert f"{CONTROLLED_PRESENTATION_CHECKPOINT_MARKER}outline" in checkpoint
+    assert '"fallback":true' in checkpoint
+    assert '"rounds":0' in checkpoint
+    assert '"calls":0' in checkpoint
+    assert policy._research_discovery_attempts == 3
+    assert policy._research_empty_discovery_attempts == 3
+    assert '"fallback_reason":"research_tools_unavailable_after_discovery"' in checkpoint
+
+
+def test_research_blocks_execute_code_network_bypass_but_allows_local_analysis(
+    tmp_path,
+):
+    policy = ControlledPresentationPolicy(
+        workspace_dir=str(tmp_path),
+        artifact_root_dir=None,
+        research_mode="deep",
+        stage="research",
+    )
+
+    blocked_codes = (
+        "import requests\nresponse = requests.get('https://example.com/report')",
+        "import http.client\nhttp.client.HTTPSConnection('example.com')",
+        "import pandas as pd\npd.read_html('https://example.com/report')",
+        "import subprocess\nsubprocess.run(['curl', 'https://example.com/report'])",
+        "client = __import__('requests')\nclient.get('https://example.com/report')",
+        "!/usr/bin/curl https://example.com/report",
+    )
+    blocked = [
+        policy.tool_call_error(
+            "execute_code",
+            {"code": code},
+            verified_evidence_urls=set(),
+        )
+        for code in blocked_codes
+    ]
+    allowed = policy.tool_call_error(
+        "execute_code",
+        {
+            "code": (
+                "import pandas as pd\n"
+                "note = 'requests.get is not executed'\n"
+                "result = pd.Series([1, 2, 3]).sum()"
+            )
+        },
+        verified_evidence_urls=set(),
+    )
+
+    assert all(error is not None for error in blocked)
+    assert all(
+        "CONTROLLED_PRESENTATION_RESEARCH_NETWORK_TOOL_REQUIRED" in (error or "")
+        for error in blocked
+    )
+    assert allowed is None
+
+
 def test_deep_research_stops_search_but_requires_report_after_successful_rounds(
     tmp_path,
 ):
@@ -1784,7 +2054,7 @@ def test_deep_research_stops_search_but_requires_report_after_successful_rounds(
     assert "bounded search rounds already returned candidate sources" in checkpoint
     assert "recommended dimension count is a research-quality target" in checkpoint
     assert "target_entities entry uses entity, aliases (array)" in checkpoint
-    assert "Do not inspect browser tabs, execute page scripts" in checkpoint
+    assert "Do not inspect tabs, execute page scripts" in checkpoint
     assert not (
         tmp_path
         / "output"
@@ -1792,19 +2062,27 @@ def test_deep_research_stops_search_but_requires_report_after_successful_rounds(
         / "qa"
         / "research_status.json"
     ).exists()
+    search_complete_error = policy.tool_call_error(
+        "web_search",
+        {"query": "one more query"},
+        verified_evidence_urls=set(),
+        parallel=True,
+    )
+    assert search_complete_error == (
+        "CONTROLLED_PRESENTATION_RESEARCH_SEARCH_COMPLETE: bounded research "
+        "searches are complete. Do not call web_search or tool_search again. Search "
+        "snippets are discovery only: read a small set of unique exact authoritative "
+        "candidate URLs before marking their evidence rows verified. Do not require "
+        "first-party coverage when another suitable authoritative source supports the "
+        "claim; then complete the ledger and validation report."
+    )
     assert (
         policy.tool_call_error(
-            "web_search",
-            {"query": "one more query"},
+            "tool_search",
+            {"query": "one more capability"},
             verified_evidence_urls=set(),
-            parallel=True,
         )
-        == "CONTROLLED_PRESENTATION_RESEARCH_SEARCH_COMPLETE: bounded research "
-        "searches already returned candidate sources. Do not call web_search again. "
-        "Search snippets are discovery only: read a small set of unique exact "
-        "authoritative candidate URLs before marking their evidence rows verified. "
-        "Do not require first-party coverage when another suitable authoritative "
-        "source supports the claim; then complete the ledger and validation report."
+        is None
     )
     assert (
         policy.tool_call_error(

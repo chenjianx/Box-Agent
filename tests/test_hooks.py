@@ -192,6 +192,33 @@ async def test_hook_tool_call_cycle():
 
 
 @pytest.mark.asyncio
+async def test_tool_arguments_are_validated_after_start_hook_modification():
+    class InvalidatingHook(BaseHook):
+        async def on_tool_start(
+            self,
+            *,
+            tool_call_id,
+            tool_name,
+            arguments,
+        ):
+            return {"text": 42}
+
+    events = await collect(
+        run_agent_loop(
+            llm=MockLLM(_tool_call_response("echo", {"text": "valid"})),
+            messages=_msgs(),
+            tools={"echo": EchoTool()},
+            max_steps=5,
+            hooks=[InvalidatingHook()],
+        )
+    )
+
+    result = next(event for event in events if isinstance(event, ToolCallResult))
+    assert result.success is False
+    assert result.raw_output["code"] == "INVALID_TOOL_ARGUMENTS"
+
+
+@pytest.mark.asyncio
 async def test_hook_error():
     """LLM exception triggers on_error and on_done(ERROR)."""
     hook = RecordingHook()

@@ -32,6 +32,7 @@ from ..events import (
 from ..llm.model_routing import select_auto_model
 from ..schema import Message
 from .base import EventEmittingTool, Tool, ToolResult
+from .schema_validation import ToolArgumentIssue
 from .sub_agent_capabilities import (
     BATCH_AGGREGATE_MAX_CHARS,
     BATCH_FILE_MAX_CHARS,
@@ -43,6 +44,26 @@ from .sub_agent_capabilities import (
 )
 
 _DEFAULT_SUB_AGENT_LIMITS = ToolLimitsConfig().sub_agent
+
+_DEFERRED_MCP_HEADING = "## Deferred MCP tools\n"
+_CHILD_MCP_BOUNDARY = (
+    "## Inherited MCP capability boundary\n"
+    "The parent agent owns deferred MCP discovery. Use only the real MCP tools "
+    "already present in this child tool list; `tool_search` is not available here."
+)
+
+
+def _child_safe_parent_prompt(system_prompt: str) -> str:
+    """Remove parent-only MCP discovery guidance before child inheritance."""
+    heading_index = system_prompt.find(_DEFERRED_MCP_HEADING)
+    if heading_index < 0:
+        return system_prompt
+    section_start = heading_index
+    if system_prompt[max(0, heading_index - 2) : heading_index] == "\n\n":
+        section_start = heading_index - 2
+    next_section = system_prompt.find("\n\n## ", heading_index + len(_DEFERRED_MCP_HEADING))
+    suffix = system_prompt[next_section:] if next_section >= 0 else ""
+    return f"{system_prompt[:section_start].rstrip()}\n\n{_CHILD_MCP_BOUNDARY}{suffix}"
 
 _SUB_AGENT_SYSTEM_PROMPT = """\
 You are a focused sub-agent executing a specific task delegated by the main agent.
@@ -189,17 +210,18 @@ class SubAgentTool(EventEmittingTool):
         self._artifact_root_dir = artifact_root_dir
 
     def set_parent_system_prompt(self, system_prompt: str) -> None:
-        """Attach the finalized parent prompt so child agents inherit constraints."""
-        self._parent_system_prompt = system_prompt
+        """Attach parent constraints without advertising parent-only MCP search."""
+        self._parent_system_prompt = _child_safe_parent_prompt(system_prompt)
 
     def set_tool_provider(self, provider: Callable[[], dict[str, Tool]]) -> None:
         """Wire a callable returning the parent agent's live tool map.
 
         The provider is invoked at ``execute`` time so child agents inherit the
-        parent's current toolset — including MCP tools (e.g. ``web_search``)
-        registered after this tool was constructed. Without this, the child
-        would be frozen with the construction-time snapshot and silently lose
-        late-loading tools, forcing it into brittle fallbacks (raw ``curl``).
+        parent's currently visible real tools, including MCP tools already
+        activated by the parent. Deferred discovery remains parent-owned, so
+        ``tool_search`` is intentionally absent from the child toolset. Without
+        the live provider, the child would be frozen with the construction-time
+        snapshot and silently lose late-activated tools.
         """
         self._tool_provider = provider
 
@@ -260,6 +282,12 @@ class SubAgentTool(EventEmittingTool):
             "For managed Playwright tools, browser navigation/snapshot requires "
             "`constraints.network=true`; browser interaction or `browser_run_code` also requires "
             "`constraints.external_side_effect=true`.\n\n"
+            "Before delegating independent web research, the parent must activate the exact "
+            "search/browser tools first. A child that writes one research file must declare "
+            "`constraints={read_only:false, network:true, write_scope:[\"research/dim01.md\"], "
+            "external_side_effect:false}` and use a different exact path for every sibling. "
+            "Pass `budget` as an object such as `{max_steps:12, max_tool_calls:25}`; never pass "
+            "serialized JSON text.\n\n"
             "Give parallel calls a short distinct `title`; never assign two children to write the same "
             "path. Constraints and budgets are hard runtime boundaries, not suggestions."
         )
@@ -337,22 +365,55 @@ class SubAgentTool(EventEmittingTool):
                 },
                 "constraints": {
                     "type": "object",
+                    "description": (
+                        "Hard child boundaries. Defaults are read_only=true, network=false, "
+                        "write_scope=null, external_side_effect=false. When required_tools "
+                        "contains write_file/append_file/edit_file, explicitly set "
+                        "read_only=false and an exact artifact-root-relative write_scope. "
+                        "Independent public-web research also requires network=true."
+                    ),
                     "properties": {
-                        "read_only": {"type": "boolean"},
-                        "network": {"type": "boolean"},
+                        "read_only": {
+                            "type": "boolean",
+                            "description": (
+                                "Defaults true. Set false only when the child must use a "
+                                "declared write tool, and pair it with write_scope."
+                            ),
+                        },
+                        "network": {
+                            "type": "boolean",
+                            "description": (
+                                "Defaults false. Set true for web_search or public browser "
+                                "retrieval."
+                            ),
+                        },
                         "write_scope": {
+                            "description": (
+                                "Exact artifact-root-relative path or paths this child may "
+                                "write. Parallel siblings must use mutually exclusive paths."
+                            ),
                             "oneOf": [
                                 {"type": "null"},
                                 {"type": "string"},
                                 {"type": "array", "items": {"type": "string"}},
                             ]
                         },
-                        "external_side_effect": {"type": "boolean"},
+                        "external_side_effect": {
+                            "type": "boolean",
+                            "description": (
+                                "Defaults false. Public read-only research keeps this false."
+                            ),
+                        },
                     },
                     "additionalProperties": False,
                 },
                 "budget": {
                     "type": "object",
+                    "description": (
+                        "Optional numeric limits as a JSON object, for example "
+                        "{\"max_steps\":12,\"max_tool_calls\":25}. Never pass a "
+                        "serialized JSON string."
+                    ),
                     "properties": {
                         "max_steps": {"type": "integer", "minimum": 1},
                         "max_tool_calls": {"type": "integer", "minimum": 1},
@@ -493,6 +554,34 @@ class SubAgentTool(EventEmittingTool):
             content="",
             error=json.dumps(payload, ensure_ascii=False, sort_keys=True),
             raw_output=payload,
+        )
+
+    def _invalid_arguments_result(
+        self,
+        issues: tuple[ToolArgumentIssue, ...],
+    ) -> ToolResult:
+        invalid_fields = tuple(
+            sorted(
+                {
+                    issue.path.split("/", 2)[1]
+                    .replace("~1", "/")
+                    .replace("~0", "~")
+                    for issue in issues
+                    if issue.path.startswith("/") and issue.path != "/"
+                }
+            )
+        )
+        return self._failure_result(
+            CapabilityFailure(
+                code="INVALID_DELEGATION_SPEC",
+                message=(
+                    "The sub-agent delegation does not match its declared schema; "
+                    "fix the listed fields and retry at most once."
+                ),
+                retryable=True,
+                invalid_fields=invalid_fields,
+                details={"schema_issues": [issue.to_dict() for issue in issues]},
+            )
         )
 
     def _apply_write_scopes(
@@ -684,7 +773,7 @@ class SubAgentTool(EventEmittingTool):
 
         async def read_one(path: str) -> tuple[str, ToolResult | Exception]:
             try:
-                return path, await read_tool.execute(path=path)
+                return path, await read_tool.invoke({"path": path})
             except Exception as exc:
                 # Keep one ordinary read failure from cancelling siblings.
                 # asyncio.CancelledError is a BaseException and still propagates.

@@ -478,6 +478,14 @@ class ExternalSkillRunPolicy:
     def is_direct_evidence_read_tool(self, tool_name: str) -> bool:
         return False
 
+    def direct_evidence_url(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: ToolResult,
+    ) -> str | None:
+        return None
+
     def allows_completion_continuation(self) -> bool:
         return True
 

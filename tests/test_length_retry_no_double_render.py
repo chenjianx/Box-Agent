@@ -9,12 +9,12 @@ of the first partial. On CLI stdout the user saw ``partial partial partial …
 partial complete`` glued together; on ACP hosts the ``update_agent_message``
 deltas concatenated into the same growing message.
 
-The fix splits ``length``/`max_tokens`` handling by whether visible text was
-streamed:
+The loop splits ``length``/`max_tokens`` handling by whether a tool call was
+attempted:
 
-* No visible text (pure tool_call truncation, or degenerate zero-body length):
-  SAME-messages retry with a ``set_ephemeral_max_output_tokens`` boost. Safe
-  because nothing was rendered.
+* Any tool-call attempt, parseable or broken: discard it without execution and
+  inject a hidden user recovery instruction. A write_file attempt is told to
+  use ordered chunks.
 * Visible text present: hand off to the ``truncation_continuation`` machinery
   — the partial is appended as an assistant turn and the next LLM call is
   asked to CONTINUE from the tail rather than restart.
@@ -36,7 +36,14 @@ from box_agent.events import (
     LLMOutputEvent,
     StopReason,
 )
-from box_agent.schema import LLMResponse, Message, StreamEvent, TokenUsage
+from box_agent.schema import (
+    FunctionCall,
+    Message,
+    StreamEvent,
+    TokenUsage,
+    ToolCall,
+)
+from box_agent.tools.file_tools import WriteTool
 
 
 class _ScriptedLLM:
@@ -174,7 +181,7 @@ async def test_length_with_visible_text_does_not_restream_content():
 # ── Case 1/2 (unchanged path): NO visible text → SAME-messages retry ──
 
 
-async def test_stream_dropped_mid_tool_uses_same_messages_retry_without_boost():
+async def test_stream_dropped_mid_tool_injects_recovery_without_boost():
     """When the SSE stream dies mid tool-call and nothing was rendered, the
     loop retries with SAME messages and does NOT boost ``max_tokens`` (boosting
     a stream-drop is pointless).
@@ -205,18 +212,15 @@ async def test_stream_dropped_mid_tool_uses_same_messages_retry_without_boost():
     done = [e for e in events if isinstance(e, DoneEvent)][-1]
     assert done.stop_reason == StopReason.END_TURN
     assert llm.calls == 2
-    # SAME-messages retry: both snapshots have the same length.
-    assert len(llm.message_snapshots[0]) == len(llm.message_snapshots[1])
+    assert len(llm.message_snapshots[1]) > len(llm.message_snapshots[0])
     # No boost on a stream-drop.
     assert llm.ephemeral_max_tokens_history == [None, None]
-    # No spurious continuation injection either.
-    assert not [e for e in events if isinstance(e, InjectedMessageEvent)]
+    injected = [e for e in events if isinstance(e, InjectedMessageEvent)]
+    assert len(injected) == 1
+    assert "None of its tool calls were executed" in injected[0].content
 
 
-async def test_output_cap_truncation_without_visible_text_boosts_max_tokens():
-    """Genuine output-cap truncation on tool_call JSON (no visible text)
-    triggers a SAME-messages retry WITH a ``max_tokens`` boost.
-    """
+async def test_output_cap_write_truncation_injects_chunk_recovery_without_boost():
     llm = _ScriptedLLM(
         [
             {
@@ -242,14 +246,129 @@ async def test_output_cap_truncation_without_visible_text_boosts_max_tokens():
     done = [e for e in events if isinstance(e, DoneEvent)][-1]
     assert done.stop_reason == StopReason.END_TURN
     assert llm.calls == 2
-    # Boost applied on the 2nd request. The exact value depends on the
-    # requested cap * (retries+1), so just assert it's set and > requested.
-    assert llm.ephemeral_max_tokens_history[0] is None
-    boosted = llm.ephemeral_max_tokens_history[1]
-    assert boosted is not None and boosted > llm.max_output_tokens
+    assert llm.ephemeral_max_tokens_history == [None, None]
+    injected = [e for e in events if isinstance(e, InjectedMessageEvent)]
+    assert len(injected) == 1
+    assert "next_chunk_index" in injected[0].content
+    assert "only when no chunk has been accepted" in injected[0].content
+    assert "that response made no file-system changes" in injected[0].content
 
 
-async def test_tool_argument_limit_injects_one_staged_write_repair_without_boost():
+@pytest.mark.parametrize("finish_reason", ["length", "max_tokens"])
+async def test_parseable_output_length_write_call_is_not_executed(
+    tmp_path,
+    finish_reason,
+):
+    target = tmp_path / "large.html"
+    llm = _ScriptedLLM(
+        [
+            {
+                "finish_reason": finish_reason,
+                "tool_calls": [
+                    ToolCall(
+                        id="call_write",
+                        type="function",
+                        function=FunctionCall(
+                            name="write_file",
+                            arguments={"path": "large.html", "content": "partial"},
+                        ),
+                    )
+                ],
+            },
+            {"text": "recovered.", "finish_reason": "stop"},
+        ]
+    )
+
+    events = await _collect(
+        run_agent_loop(
+            llm=llm,
+            messages=_msgs(),
+            tools={"write_file": WriteTool(workspace_dir=str(tmp_path))},
+            max_steps=5,
+        )
+    )
+
+    assert not target.exists()
+    retry_history = llm.message_snapshots[1]
+    assert not [message for message in retry_history if message.role == "tool"]
+    assert not [message for message in retry_history if message.tool_calls]
+    injected = [e for e in events if isinstance(e, InjectedMessageEvent)]
+    assert len(injected) == 1
+    assert "None of the tool calls in that response were executed" in injected[0].content
+
+
+async def test_output_length_recovery_can_resume_an_existing_write_transaction(
+    tmp_path,
+):
+    target = tmp_path / "large.txt"
+    write_tool = WriteTool(workspace_dir=str(tmp_path))
+    accepted = await write_tool.execute(
+        path="large.txt",
+        content="first-",
+        chunk_index=0,
+        final=False,
+    )
+    assert accepted.success
+    assert accepted.raw_output["next_chunk_index"] == 1
+
+    llm = _ScriptedLLM(
+        [
+            {
+                "finish_reason": "length",
+                "tool_calls": [
+                    ToolCall(
+                        id="discarded-chunk",
+                        type="function",
+                        function=FunctionCall(
+                            name="write_file",
+                            arguments={
+                                "path": "large.txt",
+                                "content": "must-not-be-written",
+                                "chunk_index": 1,
+                                "final": True,
+                            },
+                        ),
+                    )
+                ],
+            },
+            {
+                "finish_reason": "tool_calls",
+                "tool_calls": [
+                    ToolCall(
+                        id="resumed-chunk",
+                        type="function",
+                        function=FunctionCall(
+                            name="write_file",
+                            arguments={
+                                "path": "large.txt",
+                                "content": "second",
+                                "chunk_index": 1,
+                                "final": True,
+                            },
+                        ),
+                    )
+                ],
+            },
+            {"text": "done.", "finish_reason": "stop"},
+        ]
+    )
+
+    events = await _collect(
+        run_agent_loop(
+            llm=llm,
+            messages=_msgs(),
+            tools={"write_file": write_tool},
+            max_steps=6,
+        )
+    )
+
+    assert target.read_text(encoding="utf-8") == "first-second"
+    injected = [e for e in events if isinstance(e, InjectedMessageEvent)]
+    assert len(injected) == 1
+    assert "continue with the next_chunk_index" in injected[0].content
+
+
+async def test_tool_argument_limit_injects_one_chunked_write_repair_without_boost():
     llm = _ScriptedLLM(
         [
             {
@@ -269,7 +388,8 @@ async def test_tool_argument_limit_injects_one_staged_write_repair_without_boost
     assert [e for e in events if isinstance(e, DoneEvent)][-1].stop_reason == StopReason.END_TURN
     injected = [e for e in events if isinstance(e, InjectedMessageEvent)]
     assert len(injected) == 1
-    assert "staged_file_write" in injected[0].content
+    assert "write_file" in injected[0].content
+    assert "chunk_index=0" in injected[0].content
     assert "工具没有执行" in injected[0].content
     assert llm.ephemeral_max_tokens_history == [None, None]
 
@@ -278,7 +398,7 @@ async def test_repeated_tool_argument_limit_stops_after_one_repair():
     oversized = {
         "finish_reason": "tool_argument_limit",
         "oversized_tool_calls": [
-            {"name": "write_file", "arguments_len": 16001, "limit": 16000}
+            {"name": "bash", "arguments_len": 10001, "limit": 10000}
         ],
     }
     llm = _ScriptedLLM([oversized, oversized])

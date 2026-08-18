@@ -107,12 +107,16 @@ def test_agent_logger_summarizes_large_records_by_default(tmp_path, monkeypatch)
         result_success=True,
         result_content=long_text,
         raw_output={"full": long_text},
+        tool_id="mcp:files/read_file",
+        server_name="files",
     )
 
     log_text = agent_logger.get_log_file_path().read_text(encoding="utf-8")
     assert long_text not in log_text
     assert '"characters": 2000' in log_text
     assert '"mode": "summary"' in log_text
+    assert '"tool_id": "mcp:files/read_file"' in log_text
+    assert '"server_name": "files"' in log_text
 
 
 def test_agent_logger_records_cache_fingerprint(tmp_path, monkeypatch) -> None:

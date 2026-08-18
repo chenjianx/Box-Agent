@@ -78,11 +78,11 @@ from box_agent.tools.setup import (
     build_image_generation_prompt,
     build_sandbox_info_prompt,
     initialize_base_tools,
-    merge_mcp_tools,
-    register_mcp_tools,
+    sync_mcp_tool_list,
+    sync_mcp_tools,
 )
 from box_agent.tools.bash_tool import BashTool
-from box_agent.tools.staged_file_write_tool import StagedFileWriteTool
+from box_agent.tools.file_tools import WriteTool
 from box_agent.tools.browser_runtime_scope import (
     release_browser_runtime,
     reset_browser_runtime_owner,
@@ -815,6 +815,7 @@ class SessionState:
         default_factory=dict
     )
     follow_up_suggestions_enabled: bool = False
+    follow_up_suggestions_task: asyncio.Task[None] | None = None
     turn_counter: int = 0
     current_turn_id: str = ""
     source_text: str = ""  # accumulated real user requests for source-bound artifact checks
@@ -824,6 +825,7 @@ class SessionState:
     last_error_code: int | str | None = None
     last_error_category: str | None = None
     last_checkpoint: dict[str, Any] | None = None
+    mcp_fallback_tools: dict[str, Any] = field(default_factory=dict)
 
 
 _MAX_SOURCE_TEXT_ENV_CHARS = 120_000
@@ -882,8 +884,9 @@ class BoxACPAgent:
         self._memory = memory_manager
         self._hooks = hooks
         self._skill_loader = skill_loader
-        self._mcp_task = mcp_task  # background-loaded MCP tools; awaited on first prompt
-        self._mcp_loaded = mcp_task is None  # True once MCP has been injected
+        self._base_mcp_fallback_tools: dict[str, Any] = {}
+        self._mcp_task = mcp_task  # background MCP discovery; awaited on first prompt
+        self._mcp_loaded = mcp_task is None  # True once the live catalog is ready
         # Guards against re-scheduling the deferred finalize task on subsequent
         # prompts while the first one is still awaiting the background load.
         # Distinct from `_mcp_loaded` — see `_ensure_mcp_loaded` for why.
@@ -1037,11 +1040,12 @@ class BoxACPAgent:
             )
 
     async def _ensure_mcp_loaded(self) -> None:
-        """Merge startup MCP tools into the agent on first prompt.
+        """Finalize startup MCP discovery on the first prompt.
 
-        If the background task is already done, merge immediately (zero wait).
+        If the background task is already done, finalize immediately (zero wait).
         If it is still running, fire a background finalize task and proceed
-        without blocking — tools arrive once they are ready.
+        without blocking. Deferred mode keeps discovered tools catalog-only;
+        legacy eager mode additionally merges them into stable agent registries.
         """
         if self._mcp_loaded:
             return
@@ -1049,7 +1053,7 @@ class BoxACPAgent:
             self._mcp_loaded = True
             return
         if not self._mcp_task.done():
-            # Don't block the prompt; inject tools in background when ready.
+            # Don't block the prompt; finalize discovery in background when ready.
             # NOTE: do NOT flip _mcp_loaded here — the finalize task needs it
             # to stay False so it can actually merge when the load completes.
             # We use a separate scheduled flag to prevent re-arming on later
@@ -1059,9 +1063,18 @@ class BoxACPAgent:
                 asyncio.create_task(self._finalize_mcp_load(), name="mcp-finalize")
             return
         mcp_tools = await await_mcp_tools(self._mcp_task)
-        merge_mcp_tools(self._base_tools, mcp_tools)
-        for state in self._sessions.values():
-            register_mcp_tools(state.agent.tools, mcp_tools)
+        if not self._config.tools.mcp.deferred_loading_enabled:
+            sync_mcp_tool_list(
+                self._base_tools,
+                mcp_tools,
+                self._base_mcp_fallback_tools,
+            )
+            for state in self._sessions.values():
+                sync_mcp_tools(
+                    state.agent.tools,
+                    mcp_tools,
+                    state.mcp_fallback_tools,
+                )
         self._mcp_loaded = True
         log.info("mcp/ready", count=len(mcp_tools))
 
@@ -1078,11 +1091,31 @@ class BoxACPAgent:
         mcp_tools = await await_mcp_tools(self._mcp_task)
         if self._mcp_loaded:
             return
-        merge_mcp_tools(self._base_tools, mcp_tools)
-        for state in self._sessions.values():
-            register_mcp_tools(state.agent.tools, mcp_tools)
+        if not self._config.tools.mcp.deferred_loading_enabled:
+            sync_mcp_tool_list(
+                self._base_tools,
+                mcp_tools,
+                self._base_mcp_fallback_tools,
+            )
+            for state in self._sessions.values():
+                sync_mcp_tools(
+                    state.agent.tools,
+                    mcp_tools,
+                    state.mcp_fallback_tools,
+                )
         self._mcp_loaded = True
         log.info("mcp/ready", count=len(mcp_tools), source="deferred")
+        injected = self._inject_mcp_runtime_update(
+            name="catalog",
+            state="ready",
+            tool_count=len(mcp_tools),
+            always_load_count=sum(
+                bool(getattr(tool, "mcp_always_load", False))
+                for tool in mcp_tools
+            ),
+        )
+        if injected:
+            log.info("mcp/catalog_ready_injected", sessions=injected)
 
     async def _ensure_skills_loaded(self) -> None:
         """Await the background skill-discovery task before it's needed.
@@ -1427,6 +1460,11 @@ class BoxACPAgent:
             context_resource_dedup_enabled=(
                 self._config.agent.context_resource_dedup_enabled
             ),
+            deferred_mcp_loading_enabled=(
+                not utility
+                and self._config.tools.enable_mcp
+                and self._config.tools.mcp.deferred_loading_enabled
+            ),
         )
 
         if initial_goal_request is not None:
@@ -1481,6 +1519,7 @@ class BoxACPAgent:
             require_plan_approval=require_plan_approval,
             preloaded_skill_hashes=preloaded_skill_hashes,
             follow_up_suggestions_enabled=follow_up_suggestions_enabled,
+            mcp_fallback_tools=dict(self._base_mcp_fallback_tools),
         )
         trace_writer.write(
             "session.start",
@@ -1696,6 +1735,10 @@ class BoxACPAgent:
                 log.error("session/prompt", session_id=session_id, message="Failed to auto-create session")
                 return PromptResponse(stopReason="refusal")
 
+        pending_suggestions = state.follow_up_suggestions_task
+        if pending_suggestions is not None and not pending_suggestions.done():
+            pending_suggestions.cancel()
+        state.follow_up_suggestions_task = None
         state.cancelled = False
         was_waiting_for_user_input = state.waiting_for_user_input
         user_text = "\n".join(block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "") for block in params.prompt)
@@ -2253,21 +2296,21 @@ class BoxACPAgent:
                         turn_id=turn_id,
                         error=str(cleanup_error),
                     )
-            staged_write_tool = state.agent.tools.get("staged_file_write")
-            if isinstance(staged_write_tool, StagedFileWriteTool):
+            write_tool = state.agent.tools.get("write_file")
+            if isinstance(write_tool, WriteTool):
                 try:
-                    discarded_write_ids = staged_write_tool.cleanup_pending_writes()
-                    if discarded_write_ids:
+                    discarded_paths = write_tool.cleanup_pending_writes()
+                    if discarded_paths:
                         log.info(
-                            "staged_write/session_cleanup",
+                            "write_file/session_cleanup",
                             session_id=session_id,
                             turn_id=turn_id,
-                            count=len(discarded_write_ids),
-                            write_ids=discarded_write_ids,
+                            count=len(discarded_paths),
+                            paths=discarded_paths,
                         )
                 except Exception as cleanup_error:
                     log.error(
-                        "staged_write/session_cleanup_failed",
+                        "write_file/session_cleanup_failed",
                         session_id=session_id,
                         turn_id=turn_id,
                         error=str(cleanup_error),
@@ -2431,6 +2474,9 @@ class BoxACPAgent:
                     turn_id=state.current_turn_id,
                 )
             state.cancelled = True
+            pending_suggestions = state.follow_up_suggestions_task
+            if pending_suggestions is not None and not pending_suggestions.done():
+                pending_suggestions.cancel()
             log.info("session/cancel", session_id=params.sessionId, message="Cancel requested")
 
     def _apply_goal_action(self, agent: Agent, params: dict[str, Any]) -> dict[str, Any]:
@@ -2644,31 +2690,157 @@ class BoxACPAgent:
             name = params.get("name", "")
             if not name:
                 return {"success": False, "error": "name is required"}
-            from box_agent.tools.mcp_loader import reconnect_mcp_server, get_mcp_tools_for_server
+            from box_agent.tools.mcp_loader import (
+                get_all_mcp_tools,
+                get_mcp_tools_for_server,
+                reconnect_mcp_server,
+            )
             result = await reconnect_mcp_server(name)
+            if not self._config.tools.mcp.deferred_loading_enabled:
+                all_mcp_tools = get_all_mcp_tools()
+                sync_mcp_tool_list(
+                    self._base_tools,
+                    all_mcp_tools,
+                    self._base_mcp_fallback_tools,
+                )
+                for state in self._sessions.values():
+                    sync_mcp_tools(
+                        state.agent.tools,
+                        all_mcp_tools,
+                        state.mcp_fallback_tools,
+                    )
             if result.get("success"):
                 new_tools = get_mcp_tools_for_server(name)
-                if new_tools:
-                    merge_mcp_tools(self._base_tools, new_tools)
-                    for state in self._sessions.values():
-                        register_mcp_tools(state.agent.tools, new_tools)
-            log.info("mcp/reconnect", server=name, success=result.get("success"), error=result.get("error"))
+                injected = self._inject_mcp_runtime_update(
+                    name=name,
+                    state="connected",
+                    tool_count=len(new_tools),
+                    always_load_count=sum(
+                        bool(getattr(tool, "mcp_always_load", False))
+                        for tool in new_tools
+                    ),
+                )
+            else:
+                injected = self._inject_mcp_runtime_update(
+                    name=name,
+                    state="failed",
+                )
+            log.info(
+                "mcp/reconnect",
+                server=name,
+                success=result.get("success"),
+                error=result.get("error"),
+                context_injected_sessions=injected,
+            )
             return result
         if method == "mcp/disconnect":
             name = params.get("name", "")
             if not name:
                 return {"success": False, "error": "name is required"}
-            from box_agent.tools.mcp_loader import disconnect_mcp_server
+            from box_agent.tools.mcp_loader import (
+                disconnect_mcp_server,
+                get_all_mcp_tools,
+            )
             result = await disconnect_mcp_server(name)
             removed = set(result.get("removedTools", []))
-            if removed:
-                self._base_tools[:] = [t for t in self._base_tools if t.name not in removed]
+            if not self._config.tools.mcp.deferred_loading_enabled:
+                all_mcp_tools = get_all_mcp_tools()
+                sync_mcp_tool_list(
+                    self._base_tools,
+                    all_mcp_tools,
+                    self._base_mcp_fallback_tools,
+                )
                 for state in self._sessions.values():
-                    for tool_name in removed:
-                        state.agent.tools.pop(tool_name, None)
-            log.info("mcp/disconnect", server=name, removed=len(removed))
+                    sync_mcp_tools(
+                        state.agent.tools,
+                        all_mcp_tools,
+                        state.mcp_fallback_tools,
+                    )
+            injected = self._inject_mcp_runtime_update(
+                name=name,
+                state="disconnected",
+                tool_count=len(removed),
+            )
+            log.info(
+                "mcp/disconnect",
+                server=name,
+                removed=len(removed),
+                context_injected_sessions=injected,
+            )
             return result
         return {"error": f"unknown_method: {method}"}
+
+    def _inject_mcp_runtime_update(
+        self,
+        *,
+        name: str,
+        state: str,
+        tool_count: int = 0,
+        always_load_count: int = 0,
+    ) -> int:
+        """Inject a hidden, authoritative MCP state change into active turns only."""
+        injected = 0
+        update_id = uuid4().hex
+        for session_id, session in self._sessions.items():
+            if not session.turn_active:
+                continue
+            if state == "ready":
+                visibility = (
+                    f" {always_load_count} alwaysLoad tool(s) are already visible;"
+                    if always_load_count
+                    else ""
+                )
+                content = (
+                    f"[MCP runtime update] Initial MCP catalog discovery is complete "
+                    f"with {tool_count} registered tools. Retry tool_search now if an "
+                    f"earlier search reported that the catalog was still loading.{visibility} "
+                    "ordinary deferred schemas remain hidden until selected by tool_search."
+                )
+            elif state == "connected":
+                if session.agent.mcp_tool_exposure is not None:
+                    visibility = (
+                        f"{always_load_count} alwaysLoad tool(s) are already visible. "
+                        if always_load_count
+                        else ""
+                    )
+                    detail = (
+                        f"{tool_count} tools are registered in the deferred catalog. "
+                        f"{visibility}Ordinary deferred schemas were not bulk-injected. "
+                        "Use tool_search now to "
+                        "discover and activate only the capability needed; an activated "
+                        "tool becomes callable by its real name on the next step."
+                    )
+                else:
+                    detail = (
+                        f"{tool_count} tools are registered and available to the next "
+                        "model step."
+                    )
+                content = (
+                    f"[MCP runtime update] Server '{name}' is connected and its tools "
+                    f"are registered. {detail} This runtime update, not the preceding "
+                    "mcp_config file write, is connection confirmation."
+                )
+            elif state == "failed":
+                content = (
+                    f"[MCP runtime update] Server '{name}' did not connect, so its tools "
+                    "are not newly available. Do not describe the mcp_config write as a "
+                    "successful connection."
+                )
+            else:
+                content = (
+                    f"[MCP runtime update] Server '{name}' is disconnected and "
+                    f"{tool_count} registered tools were removed. Do not call them."
+                )
+            session.inject_queue.put_nowait(
+                {
+                    "id": f"mcp-runtime-{update_id}-{session_id}",
+                    "content": content,
+                    "user_visible": False,
+                    "source": "runtime",
+                }
+            )
+            injected += 1
+        return injected
 
     ext_method = extMethod
 
@@ -3413,12 +3585,11 @@ class BoxACPAgent:
                 update_tool_call(tool_call_id, raw_output=payload),
             )
 
-        async def _generate_follow_up_suggestions(final_content: str) -> list[str]:
-            latest_user_request = ""
-            for message in reversed(agent.messages):
-                if message.role == "user" and isinstance(message.content, str):
-                    latest_user_request = message.content
-                    break
+        async def _generate_follow_up_suggestions(
+            latest_user_request: str,
+            final_content: str,
+            suggestion_turn_id: str,
+        ) -> list[str]:
             if not latest_user_request or not final_content.strip():
                 return []
 
@@ -3431,7 +3602,7 @@ class BoxACPAgent:
                     ),
                     system_prompt=build_follow_up_suggestions_generation_system_prompt(),
                     session_id=state.upstream_session_id,
-                    turn_id=state.current_turn_id,
+                    turn_id=suggestion_turn_id,
                     title=state.upstream_title,
                     call_kind="utility",
                     timeout=8.0,
@@ -3452,6 +3623,70 @@ class BoxACPAgent:
                 duration_ms=result.duration_ms,
             )
             return suggestions
+
+        async def _generate_and_send_follow_up_suggestions(
+            latest_user_request: str,
+            final_content: str,
+            expected_turn_id: str,
+        ) -> None:
+            try:
+                suggestions = await _generate_follow_up_suggestions(
+                    latest_user_request,
+                    final_content,
+                    expected_turn_id,
+                )
+                if (
+                    state.current_turn_id != expected_turn_id
+                    or state.cancelled
+                    or not suggestions
+                ):
+                    return
+                await self._send(
+                    session_id,
+                    update_tool_call(
+                        f"follow-up-suggestions-{uuid4().hex[:8]}",
+                        raw_output={
+                            "type": "follow_up_suggestions",
+                            "turn_id": expected_turn_id,
+                            "suggestions": suggestions,
+                        },
+                    ),
+                )
+            except asyncio.CancelledError:
+                log.info(
+                    "follow_up_suggestions/cancelled",
+                    session_id=session_id,
+                    turn_id=expected_turn_id,
+                )
+            except Exception as exc:
+                log.exception(
+                    "follow_up_suggestions/error",
+                    exc,
+                    session_id=session_id,
+                    turn_id=expected_turn_id,
+                )
+
+        def _schedule_follow_up_suggestions(final_content: str) -> None:
+            latest_user_request = ""
+            for message in reversed(agent.messages):
+                if message.role == "user" and isinstance(message.content, str):
+                    latest_user_request = message.content
+                    break
+            task = asyncio.create_task(
+                _generate_and_send_follow_up_suggestions(
+                    latest_user_request,
+                    final_content,
+                    turn_id,
+                ),
+                name=f"follow-up-suggestions:{session_id}:{turn_id}",
+            )
+            state.follow_up_suggestions_task = task
+
+            def _clear_finished_task(completed: asyncio.Task[None]) -> None:
+                if state.follow_up_suggestions_task is completed:
+                    state.follow_up_suggestions_task = None
+
+            task.add_done_callback(_clear_finished_task)
 
         llm: Any = _ActionHintNormalizingLLM(agent.llm)
         if state.follow_up_suggestions_enabled:
@@ -3618,7 +3853,14 @@ class BoxACPAgent:
                             ),
                         )
 
-                    case ToolCallStartEvent(tool_call_id=tid, tool_name=name, arguments=args, user_visible=user_visible):
+                    case ToolCallStartEvent(
+                        tool_call_id=tid,
+                        tool_name=name,
+                        arguments=args,
+                        user_visible=user_visible,
+                        tool_id=tool_id,
+                        server_name=server_name,
+                    ):
                         log.info(
                             "tool/start",
                             session_id=session_id,
@@ -3626,6 +3868,8 @@ class BoxACPAgent:
                             tool_name=name,
                             arguments=args,
                             user_visible=user_visible,
+                            tool_id=tool_id,
+                            server_name=server_name,
                         )
                         if name == "get_skill":
                             skill_name = _get_skill_name_from_args(args)
@@ -3658,11 +3902,31 @@ class BoxACPAgent:
                         raw_output=raw_output,
                         user_visible=user_visible,
                         policy_decision=policy_decision,
+                        tool_id=tool_id,
+                        server_name=server_name,
                     ):
                         if ok:
-                            log.info("tool/end", session_id=session_id, tool_call_id=tid, tool_name=tname, result=text, user_visible=user_visible)
+                            log.info(
+                                "tool/end",
+                                session_id=session_id,
+                                tool_call_id=tid,
+                                tool_name=tname,
+                                tool_id=tool_id,
+                                server_name=server_name,
+                                result=text,
+                                user_visible=user_visible,
+                            )
                         else:
-                            log.warn("tool/fail", session_id=session_id, tool_call_id=tid, tool_name=tname, error=err, user_visible=user_visible)
+                            log.warn(
+                                "tool/fail",
+                                session_id=session_id,
+                                tool_call_id=tid,
+                                tool_name=tname,
+                                tool_id=tool_id,
+                                server_name=server_name,
+                                error=err,
+                                user_visible=user_visible,
+                            )
                         if ok and tname in {"request_user_input", "request_user_decision"}:
                             state.waiting_for_user_input = True
                             log.info(
@@ -3815,13 +4079,12 @@ class BoxACPAgent:
                             )
                         suggestions = getattr(llm, "follow_up_suggestions", [])
                         if (
-                            reason == StopReason.END_TURN
+                            state.follow_up_suggestions_enabled
+                            and reason == StopReason.END_TURN
                             and state.pending_plan_approval is None
                             and not state.waiting_for_user_input
                             and (state.agent.goal is None or state.agent.goal.status != "active")
                         ):
-                            if not suggestions:
-                                suggestions = await _generate_follow_up_suggestions(final_content)
                             if suggestions:
                                 await self._send(
                                     session_id,
@@ -3833,6 +4096,8 @@ class BoxACPAgent:
                                         },
                                     ),
                                 )
+                            else:
+                                _schedule_follow_up_suggestions(final_content)
                         await _send_turn_usage()
                         return reason.value
 

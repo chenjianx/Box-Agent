@@ -183,6 +183,15 @@ def test_description_prefers_cost_aware_batching_and_parent_merge():
     assert "Do not create multiple children merely because there are five or more units" in description
     assert "parent remains responsible" in description
     assert "final deliverables" in description
+    assert "read_only:false" in description
+    assert 'write_scope:["research/dim01.md"]' in description
+    assert "Pass `budget` as an object" in description
+    assert "never pass serialized JSON text" in description
+
+    parameters = tool.parameters["properties"]
+    assert "Never pass a serialized JSON string" in parameters["budget"]["description"]
+    assert "Defaults are read_only=true" in parameters["constraints"]["description"]
+    assert "mutually exclusive paths" in parameters["constraints"]["properties"]["write_scope"]["description"]
 
 
 # ── Tool filtering ───────────────────────────────────────────
@@ -326,6 +335,24 @@ def test_agent_wires_system_prompt_into_sub_agent(tmp_path):
     assert "Current Workspace" in tool._parent_system_prompt
 
 
+def test_sub_agent_prompt_replaces_parent_only_mcp_search_guidance(tmp_path):
+    llm = AsyncMock()
+    tool = SubAgentTool(llm=llm, parent_tools={})
+
+    agent = Agent(
+        llm_client=llm,
+        system_prompt="Parent constraint.",
+        tools=[tool],
+        workspace_dir=str(tmp_path),
+        deferred_mcp_loading_enabled=True,
+    )
+
+    assert tool._parent_system_prompt is not None
+    assert "Use `tool_search`" not in tool._parent_system_prompt
+    assert "The parent agent owns deferred MCP discovery" in tool._parent_system_prompt
+    assert "tool_search" not in agent._inherited_tools()
+
+
 async def test_sub_agent_read_ledger_is_local_to_child_context(tmp_path):
     from box_agent.schema import FunctionCall, ToolCall
 
@@ -451,6 +478,47 @@ async def test_invalid_new_style_spec_never_falls_back_or_calls_llm():
     assert "minimal_valid_example" in result.raw_output
     assert result.raw_output["retry_limit"] == 1
     llm.generate.assert_not_called()
+    llm.generate_stream.assert_not_called()
+
+
+async def test_invalid_budget_string_returns_object_correction_example():
+    llm = AsyncMock()
+    tool = SubAgentTool(llm=llm, parent_tools={})
+
+    result = await tool.execute(
+        task="Research one dimension",
+        capabilities={"required_tools": ["read_file"]},
+        budget='{"max_steps": 12, "max_tool_calls": 25}',
+    )
+
+    assert result.success is False
+    assert result.raw_output["code"] == "INVALID_DELEGATION_SPEC"
+    assert result.raw_output["invalid_fields"] == ["budget"]
+    assert result.raw_output["field_corrections"]["budget"] == {
+        "message": "Pass budget as a JSON object, never as a JSON string.",
+        "example": {"max_steps": 12, "max_tool_calls": 25},
+    }
+    llm.generate_stream.assert_not_called()
+
+
+async def test_write_conflict_returns_scoped_write_correction_hint(tmp_path):
+    llm = AsyncMock()
+    tool = SubAgentTool(
+        llm=llm,
+        parent_tools={"write_file": WriteTool(workspace_dir=str(tmp_path))},
+        workspace_dir=str(tmp_path),
+    )
+
+    result = await tool.execute(
+        task="Write one research dimension",
+        capabilities={"required_tools": ["write_file"]},
+    )
+
+    assert result.success is False
+    assert result.raw_output["code"] == "CAPABILITY_CONSTRAINT_CONFLICT"
+    assert "constraints.read_only=false" in result.raw_output["correction_hint"]
+    assert "constraints.write_scope" in result.raw_output["correction_hint"]
+    assert "external_side_effect=false" in result.raw_output["correction_hint"]
     llm.generate_stream.assert_not_called()
 
 

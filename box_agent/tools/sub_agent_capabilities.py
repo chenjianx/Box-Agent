@@ -183,6 +183,45 @@ class CapabilityFailure:
         if self.code == "INVALID_DELEGATION_SPEC":
             payload["minimal_valid_example"] = MINIMAL_DELEGATION_EXAMPLE
             payload["retry_limit"] = 1
+            field_corrections: dict[str, Any] = {}
+            if any(field == "budget" or field.startswith("budget.") for field in self.invalid_fields):
+                field_corrections["budget"] = {
+                    "message": "Pass budget as a JSON object, never as a JSON string.",
+                    "example": {"max_steps": 12, "max_tool_calls": 25},
+                }
+            if any(
+                field == "constraints" or field.startswith("constraints.")
+                for field in self.invalid_fields
+            ):
+                field_corrections["constraints"] = {
+                    "message": (
+                        "Declare write and network permissions explicitly; keep the "
+                        "write scope limited to this child's exact output path."
+                    ),
+                    "example": {
+                        "read_only": False,
+                        "network": True,
+                        "write_scope": ["research/dim01.md"],
+                        "external_side_effect": False,
+                    },
+                }
+            if field_corrections:
+                payload["field_corrections"] = field_corrections
+        elif self.code == "CAPABILITY_CONSTRAINT_CONFLICT" and self.details:
+            denied_reason = self.details.get("denied_reason")
+            denied_tool = self.details.get("tool")
+            if denied_reason == "read_only" and denied_tool in {
+                "write_file",
+                "append_file",
+                "edit_file",
+            }:
+                payload["correction_hint"] = (
+                    "If this child must write, retry once with "
+                    "constraints.read_only=false and an exact artifact-root-relative "
+                    "constraints.write_scope for only this child's output. Keep "
+                    "external_side_effect=false unless the task explicitly needs an "
+                    "external write."
+                )
         return payload
 
 

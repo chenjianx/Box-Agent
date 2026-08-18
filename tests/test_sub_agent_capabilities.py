@@ -227,6 +227,34 @@ def test_constraints_reject_required_writes_and_network_tools() -> None:
     assert network_result.details["denied_reason"] == "network_disabled"
 
 
+def test_scoped_web_research_write_constraints_resolve_minimum_tools() -> None:
+    spec = _parse(
+        capabilities={"required_tools": ["web_search", "write_file"]},
+        constraints={
+            "read_only": False,
+            "network": True,
+            "write_scope": ["research/dim01.md"],
+            "external_side_effect": False,
+        },
+        budget={"max_steps": 12, "max_tool_calls": 25},
+    )
+    assert isinstance(spec, DelegationSpec)
+
+    result = CapabilityResolver().resolve(
+        spec,
+        parent_tools={
+            "web_search": NamedTool("web_search"),
+            "write_file": NamedTool("write_file"),
+        },
+    )
+
+    assert isinstance(result, ResolvedCapabilityBundle)
+    assert result.resolved_tool_names == ("web_search", "write_file")
+    assert result.spec.constraints.write_scope == ("research/dim01.md",)
+    assert result.spec.budget.max_steps == 12
+    assert result.spec.budget.max_tool_calls == 25
+
+
 def test_playwright_capabilities_are_explicit_and_constraint_aware() -> None:
     navigate = NamedMcpTool("browser_navigate", "playwright")
     navigate_spec = _parse(

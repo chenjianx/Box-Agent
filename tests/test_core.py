@@ -888,6 +888,126 @@ async def test_simple_conversation():
     assert done.final_content == "hello"
 
 
+class SchemaGuardTool(Tool):
+    def __init__(self, *, parallel_safe: bool = False) -> None:
+        self.parallel_safe = parallel_safe
+        self.calls: list[str] = []
+
+    @property
+    def name(self) -> str:
+        return "schema_guard"
+
+    @property
+    def description(self) -> str:
+        return "Execute only schema-valid calls."
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        }
+
+    async def execute(self, text: str) -> ToolResult:
+        self.calls.append(text)
+        return ToolResult(success=True, content=text)
+
+
+@pytest.mark.asyncio
+async def test_sequential_runtime_rejects_invalid_tool_arguments_before_execution():
+    tool = SchemaGuardTool()
+    responses = [
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="invalid-schema-call",
+                    type="function",
+                    function=FunctionCall(
+                        name=tool.name,
+                        arguments={"text": 42},
+                    ),
+                )
+            ],
+            finish_reason="tool",
+        ),
+        LLMResponse(content="done", finish_reason="stop"),
+    ]
+
+    events = await collect(
+        run_agent_loop(
+            llm=MockLLM(responses),
+            messages=_msgs(),
+            tools={tool.name: tool},
+            max_steps=5,
+        )
+    )
+
+    result = next(
+        event
+        for event in events
+        if isinstance(event, ToolCallResult)
+        and event.tool_call_id == "invalid-schema-call"
+    )
+    assert result.success is False
+    assert result.raw_output["code"] == "INVALID_TOOL_ARGUMENTS"
+    assert tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_parallel_runtime_validates_each_tool_call_independently():
+    tool = SchemaGuardTool(parallel_safe=True)
+    responses = [
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="valid-parallel-call",
+                    type="function",
+                    function=FunctionCall(
+                        name=tool.name,
+                        arguments={"text": "ok"},
+                    ),
+                ),
+                ToolCall(
+                    id="invalid-parallel-call",
+                    type="function",
+                    function=FunctionCall(
+                        name=tool.name,
+                        arguments={"extra": "no"},
+                    ),
+                ),
+            ],
+            finish_reason="tool",
+        ),
+        LLMResponse(content="done", finish_reason="stop"),
+    ]
+
+    events = await collect(
+        run_agent_loop(
+            llm=MockLLM(responses),
+            messages=_msgs(),
+            tools={tool.name: tool},
+            max_steps=5,
+            max_parallel_tools=2,
+        )
+    )
+
+    results = {
+        event.tool_call_id: event
+        for event in events
+        if isinstance(event, ToolCallResult)
+    }
+    assert results["valid-parallel-call"].success is True
+    assert results["invalid-parallel-call"].success is False
+    assert results["invalid-parallel-call"].raw_output["code"] == (
+        "INVALID_TOOL_ARGUMENTS"
+    )
+    assert tool.calls == ["ok"]
+
+
 @pytest.mark.asyncio
 async def test_long_plain_answer_streams_before_finish_without_duplicate():
     chunks = ["李白是唐代诗人，" * 20, "他的诗歌想象瑰丽，" * 20, "后世称他为诗仙。"]
@@ -1919,8 +2039,8 @@ async def test_context_resource_dedup_can_be_disabled(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_write_file_large_artifact_arguments_are_compacted_in_model_history(tmp_path):
-    marker = "SHOULD_NOT_STAY_IN_ASSISTANT_TOOL_ARGS"
+async def test_write_file_large_artifact_arguments_remain_in_model_history(tmp_path):
+    marker = "SHOULD_STAY_IN_ASSISTANT_TOOL_ARGS"
     html = "\n".join(
         ["<!doctype html>", "<html>", "<body>"]
         + [f"<section class='slide'>slide {i}</section>" for i in range(80)]
@@ -1960,13 +2080,12 @@ async def test_write_file_large_artifact_arguments_are_compacted_in_model_histor
 
     assistant_msg = next(m for m in msgs if m.role == "assistant" and m.tool_calls)
     stored_args = assistant_msg.tool_calls[0].function.arguments
-    assert "[Full tool-call argument omitted from model history]" in stored_args["content"]
-    assert "deck.html" in stored_args["content"]
-    assert marker not in stored_args["content"]
+    assert stored_args["content"] == html
+    assert marker in stored_args["content"]
 
 
 @pytest.mark.asyncio
-async def test_consecutive_html_writes_delay_compaction_for_one_model_turn(tmp_path):
+async def test_consecutive_html_writes_remain_visible_in_all_model_turns(tmp_path):
     first_html = "<section class='slide'>FIRST_REAL_FRAGMENT</section>"
     second_html = "<section class='slide'>SECOND_REAL_FRAGMENT</section>"
     msgs = _msgs()
@@ -2034,9 +2153,7 @@ async def test_consecutive_html_writes_delay_compaction_for_one_model_turn(tmp_p
         if message.role == "assistant" and message.tool_calls
         for tool_call in message.tool_calls
     ]
-    assert "[Full tool-call argument omitted from model history]" in (
-        third_request_calls[0].function.arguments["content"]
-    )
+    assert third_request_calls[0].function.arguments["content"] == first_html
     assert third_request_calls[1].function.arguments["content"] == second_html
 
     stored_calls = [
@@ -2045,11 +2162,10 @@ async def test_consecutive_html_writes_delay_compaction_for_one_model_turn(tmp_p
         if message.role == "assistant" and message.tool_calls
         for tool_call in message.tool_calls
     ]
-    assert all(
-        "[Full tool-call argument omitted from model history]"
-        in tool_call.function.arguments["content"]
-        for tool_call in stored_calls
-    )
+    assert [tool_call.function.arguments["content"] for tool_call in stored_calls] == [
+        first_html,
+        second_html,
+    ]
     assert (tmp_path / "drafts/slides_01_04.html").read_text() == first_html
     assert (tmp_path / "drafts/slides_05_08.html").read_text() == second_html
 
@@ -2441,8 +2557,8 @@ async def test_repeated_placeholder_error_is_compacted_after_one_repair_hint(tmp
 
 
 @pytest.mark.asyncio
-async def test_write_file_qa_json_arguments_are_compacted_even_when_small(tmp_path):
-    marker = "SHOULD_NOT_STAY_IN_QA_TOOL_ARGS"
+async def test_write_file_qa_json_arguments_remain_in_model_history(tmp_path):
+    marker = "SHOULD_STAY_IN_QA_TOOL_ARGS"
     content = f'{{"ok": false, "details": "{marker}"}}'
     msgs = _msgs()
     llm = MockLLM([
@@ -2473,14 +2589,13 @@ async def test_write_file_qa_json_arguments_are_compacted_even_when_small(tmp_pa
     assert (tmp_path / "qa.json").read_text(encoding="utf-8") == content
     assistant_msg = next(m for m in msgs if m.role == "assistant" and m.tool_calls)
     stored_args = assistant_msg.tool_calls[0].function.arguments
-    assert "[Full tool-call argument omitted from model history]" in stored_args["content"]
-    assert "qa.json" in stored_args["content"]
-    assert marker not in stored_args["content"]
+    assert stored_args["content"] == content
+    assert marker in stored_args["content"]
 
 
 @pytest.mark.asyncio
-async def test_append_file_large_artifact_arguments_are_compacted_in_model_history(tmp_path):
-    marker = "APPENDED_HTML_SHOULD_NOT_STAY_IN_ASSISTANT_TOOL_ARGS"
+async def test_append_file_large_artifact_arguments_remain_in_model_history(tmp_path):
+    marker = "APPENDED_HTML_SHOULD_STAY_IN_ASSISTANT_TOOL_ARGS"
     html = "\n".join(
         ["<!doctype html>", "<html>", "<body>"]
         + [f"<section>chunk {i}</section>" for i in range(20)]
@@ -2520,15 +2635,14 @@ async def test_append_file_large_artifact_arguments_are_compacted_in_model_histo
 
     assistant_msg = next(m for m in msgs if m.role == "assistant" and m.tool_calls)
     stored_args = assistant_msg.tool_calls[0].function.arguments
-    assert "[Full tool-call argument omitted from model history]" in stored_args["content"]
-    assert "deck.html" in stored_args["content"]
-    assert marker not in stored_args["content"]
+    assert stored_args["content"] == html
+    assert marker in stored_args["content"]
 
 
 @pytest.mark.asyncio
-async def test_edit_file_large_artifact_arguments_omit_previews_in_model_history(tmp_path):
-    old_marker = "OLD_HTML_SHOULD_NOT_STAY_IN_ASSISTANT_TOOL_ARGS"
-    new_marker = "NEW_HTML_SHOULD_NOT_STAY_IN_ASSISTANT_TOOL_ARGS"
+async def test_edit_file_large_artifact_arguments_remain_in_model_history(tmp_path):
+    old_marker = "OLD_HTML_SHOULD_STAY_IN_ASSISTANT_TOOL_ARGS"
+    new_marker = "NEW_HTML_SHOULD_STAY_IN_ASSISTANT_TOOL_ARGS"
     original = "\n".join(
         ["<!doctype html>", "<html>", "<body>"]
         + [f"<section class='slide'>slide {i}</section>" for i in range(80)]
@@ -2573,12 +2687,59 @@ async def test_edit_file_large_artifact_arguments_omit_previews_in_model_history
 
     assistant_msg = next(m for m in msgs if m.role == "assistant" and m.tool_calls)
     stored_args = assistant_msg.tool_calls[0].function.arguments
-    assert "[Full tool-call argument omitted from model history]" in stored_args["old_str"]
-    assert "[Full tool-call argument omitted from model history]" in stored_args["new_str"]
-    assert old_marker not in stored_args["old_str"]
-    assert new_marker not in stored_args["new_str"]
-    assert "Preview first" not in stored_args["old_str"]
-    assert "Preview first" not in stored_args["new_str"]
+    assert stored_args["old_str"] == original
+    assert stored_args["new_str"] == updated
+    assert old_marker in stored_args["old_str"]
+    assert new_marker in stored_args["new_str"]
+
+
+@pytest.mark.asyncio
+async def test_large_generic_tool_arguments_remain_in_model_history():
+    text = "GENERIC_TOOL_ARGUMENT_" + ("x" * 13_000)
+    messages = _msgs()
+    llm = CapturingStreamLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="echo-large",
+                        type="function",
+                        function=FunctionCall(
+                            name="echo",
+                            arguments={"text": text},
+                        ),
+                    )
+                ],
+                finish_reason="tool",
+            ),
+            LLMResponse(content="done", finish_reason="stop"),
+        ]
+    )
+
+    await collect(
+        run_agent_loop(
+            llm=llm,
+            messages=messages,
+            tools={"echo": EchoTool()},
+            max_steps=4,
+        )
+    )
+
+    second_request_call = next(
+        tool_call
+        for message in llm.message_calls[1]
+        if message.role == "assistant" and message.tool_calls
+        for tool_call in message.tool_calls
+    )
+    assert second_request_call.function.arguments["text"] == text
+    stored_call = next(
+        tool_call
+        for message in messages
+        if message.role == "assistant" and message.tool_calls
+        for tool_call in message.tool_calls
+    )
+    assert stored_call.function.arguments["text"] == text
 
 
 @pytest.mark.asyncio
@@ -2711,6 +2872,46 @@ async def test_tool_exception():
     assert len(results) == 1
     assert results[0].success is False
     assert "boom" in (results[0].error or "")
+
+
+@pytest.mark.asyncio
+async def test_tool_argument_binding_error_is_reported_without_crashing_turn():
+    """Unexpected tool arguments should fail the call without aborting the turn."""
+    llm = MockLLM([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="t1",
+                    type="function",
+                    function=FunctionCall(
+                        name="echo",
+                        arguments={"text": "hello", "path": "/tmp/output"},
+                    ),
+                )
+            ],
+            finish_reason="tool",
+        ),
+        LLMResponse(content="recovered", finish_reason="stop"),
+    ])
+
+    events = await collect(
+        run_agent_loop(
+            llm=llm,
+            messages=_msgs(),
+            tools={"echo": EchoTool()},
+            max_steps=5,
+        )
+    )
+
+    results = [event for event in events if isinstance(event, ToolCallResult)]
+    assert len(results) == 1
+    assert results[0].success is False
+    assert "unexpected keyword argument 'path'" in (results[0].error or "")
+    assert any(
+        isinstance(event, ContentEvent) and event.content == "recovered"
+        for event in events
+    )
 
 
 @pytest.mark.asyncio
@@ -2984,7 +3185,7 @@ async def test_research_evidence_calls_preserve_controlled_deck_delivery_budget(
 
 
 @pytest.mark.asyncio
-async def test_controlled_research_batches_public_page_reads(tmp_path):
+async def test_controlled_research_serializes_public_page_reads(tmp_path):
     browser = CountingBrowserReadTool()
     calls = [
         ToolCall(
@@ -3019,21 +3220,197 @@ async def test_controlled_research_batches_public_page_reads(tmp_path):
         )
     )
 
-    assert browser.urls == [
-        "https://example.com/source-1",
-        "https://example.com/source-2",
-    ]
+    assert browser.urls == ["https://example.com/source-1"]
     results = {
         event.tool_call_id: event
         for event in events
         if isinstance(event, ToolCallResult)
     }
-    for call_id in ("browser-3", "browser-4"):
+    for call_id in ("browser-2", "browser-3", "browser-4"):
         assert results[call_id].success is False
         assert results[call_id].user_visible is False
         assert "page read deferred by runtime batching" in (
             results[call_id].error or ""
         )
+
+
+@pytest.mark.asyncio
+async def test_controlled_research_binds_snapshot_body_to_navigated_url(tmp_path):
+    source_url = "https://example.com/report"
+    excerpt = "Example Entity published verified information in 2026."
+    output_dir = tmp_path / "output"
+    research_dir = output_dir / "research"
+    research_dir.mkdir(parents=True)
+    (research_dir / "market_evidence.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "topic": "market",
+                "target_entities": [
+                    {
+                        "entity": "Example Entity",
+                        "aliases": ["Example"],
+                        "official_domains": ["example.com"],
+                    }
+                ],
+                "evidence": [
+                    {
+                        "entity": "Example Entity",
+                        "claim": excerpt,
+                        "source_url": source_url,
+                        "source_type": "first_party",
+                        "evidence_excerpt": excerpt,
+                        "confidence": "high",
+                        "status": "verified",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class MetadataNavigateTool(Tool):
+        @property
+        def name(self):
+            return "browser_navigate"
+
+        @property
+        def description(self):
+            return "Navigate to one public URL"
+
+        @property
+        def parameters(self):
+            return {"type": "object", "properties": {"url": {"type": "string"}}}
+
+        async def execute(self, url: str = ""):
+            return ToolResult(
+                success=True,
+                content=(
+                    "### Page\n"
+                    f"- Page URL: {url}\n"
+                    "- Page Title: Example report\n"
+                    "### Snapshot\n"
+                    "- [Snapshot](.playwright-mcp/page.yml)"
+                ),
+            )
+
+    class SnapshotBodyTool(Tool):
+        @property
+        def name(self):
+            return "browser_snapshot"
+
+        @property
+        def description(self):
+            return "Return the current page body"
+
+        @property
+        def parameters(self):
+            return {"type": "object", "properties": {}}
+
+        async def execute(self):
+            return ToolResult(success=True, content=f"Page heading\n{excerpt}")
+
+    class CountingBashTool(Tool):
+        def __init__(self):
+            self.calls = 0
+
+        @property
+        def name(self):
+            return "bash"
+
+        @property
+        def description(self):
+            return "Run validator"
+
+        @property
+        def parameters(self):
+            return {"type": "object", "properties": {"command": {"type": "string"}}}
+
+        async def execute(self, command: str = ""):
+            self.calls += 1
+            return ToolResult(success=True, content="validator ran")
+
+    bash = CountingBashTool()
+    llm = MockLLM(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="navigate",
+                        type="function",
+                        function=FunctionCall(
+                            name="browser_navigate",
+                            arguments={"url": source_url},
+                        ),
+                    )
+                ],
+                finish_reason="tool",
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="snapshot",
+                        type="function",
+                        function=FunctionCall(
+                            name="browser_snapshot",
+                            arguments={},
+                        ),
+                    )
+                ],
+                finish_reason="tool",
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="validator",
+                        type="function",
+                        function=FunctionCall(
+                            name="bash",
+                            arguments={
+                                "command": (
+                                    "python validate_research_artifacts.py "
+                                    "--research-dir research --topic market"
+                                )
+                            },
+                        ),
+                    )
+                ],
+                finish_reason="tool",
+            ),
+            LLMResponse(content="done", finish_reason="stop"),
+        ]
+    )
+
+    events = await collect(
+        run_agent_loop(
+            llm=llm,
+            messages=_msgs(),
+            tools={
+                "browser_navigate": MetadataNavigateTool(),
+                "browser_snapshot": SnapshotBodyTool(),
+                "bash": bash,
+            },
+            max_steps=8,
+            completion_gate=CompletionGate(
+                workflow_checkpoint_kind="controlled_presentation",
+                workflow_options={"research_mode": "deep"},
+                max_continuations=0,
+            ),
+            workspace_dir=str(tmp_path),
+            artifact_root_dir=output_dir,
+        )
+    )
+
+    assert bash.calls == 1
+    validator_result = next(
+        event
+        for event in events
+        if isinstance(event, ToolCallResult) and event.tool_call_id == "validator"
+    )
+    assert validator_result.success is True
 
 
 @pytest.mark.asyncio
@@ -5114,12 +5491,7 @@ def test_micro_compact_preserves_only_latest_todo_state(latest_todo_tool):
     msgs = [
         Message(role="system", content="sys"),
         _make_tool_msg("todo_write", old_todo_content, "todo-old"),
-        _make_tool_msg(
-            latest_todo_tool,
-            latest_todo_content,
-            "todo-latest",
-            state_checkpoint=latest_todo_content,
-        ),
+        _make_tool_msg(latest_todo_tool, latest_todo_content, "todo-latest"),
         _make_tool_msg("bash", "one\n" + "a" * 500, "tc-1"),
         _make_tool_msg("read_file", "two\n" + "b" * 500, "tc-2"),
         _make_tool_msg("bash", "three\n" + "c" * 500, "tc-3"),
@@ -5732,12 +6104,7 @@ async def test_maybe_summarize_preserves_latest_todo_state_exactly(
     msgs = [
         Message(role="system", content="sys"),
         latest_user,
-        _make_tool_msg(
-            latest_todo_tool,
-            todo_state,
-            "todo-latest",
-            state_checkpoint=todo_state,
-        ),
+        _make_tool_msg(latest_todo_tool, todo_state, "todo-latest"),
         Message(role="assistant", content="large execution " * 8_000),
     ]
     llm = _FakeSummaryLLM(
@@ -5761,8 +6128,9 @@ async def test_maybe_summarize_preserves_latest_todo_state_exactly(
         and str(message.content).startswith(_TODO_STATE_MARKER)
     ]
     assert len(checkpoints) == 1
-    assert checkpoints[0].content == f"{_TODO_STATE_MARKER}\n\n{todo_state}"
-    assert checkpoints[0].state_checkpoint == todo_state
+    assert checkpoints[0].content == (
+        f"{_TODO_STATE_MARKER}\nTool: {latest_todo_tool}\n\n{todo_state}"
+    )
     assert outcome.messages[-1] is latest_user
 
     second_input = [
@@ -5784,33 +6152,8 @@ async def test_maybe_summarize_preserves_latest_todo_state_exactly(
         and str(message.content).startswith(_TODO_STATE_MARKER)
     ]
     assert [message.content for message in repeated_checkpoints] == [
-        f"{_TODO_STATE_MARKER}\n\n{todo_state}"
+        f"{_TODO_STATE_MARKER}\nTool: {latest_todo_tool}\n\n{todo_state}"
     ]
-
-
-def test_latest_todo_checkpoint_ignores_newer_failed_tool_result():
-    from box_agent.core import _latest_todo_state_checkpoint, _TODO_STATE_MARKER
-
-    canonical = "Complete current todo state"
-    messages = [
-        _make_tool_msg(
-            "todo_write",
-            canonical,
-            "todo-success",
-            state_checkpoint=canonical,
-        ),
-        _make_tool_msg(
-            "todo_write",
-            "Error: Todo #99 does not exist",
-            "todo-failure",
-        ),
-    ]
-
-    checkpoint = _latest_todo_state_checkpoint(messages)
-
-    assert checkpoint is not None
-    assert checkpoint[0] == 0
-    assert checkpoint[1].content == f"{_TODO_STATE_MARKER}\n\n{canonical}"
 
 
 @pytest.mark.asyncio

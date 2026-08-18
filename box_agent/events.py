@@ -124,6 +124,8 @@ class ToolCallStart:
     tool_name: str
     arguments: dict[str, Any]
     user_visible: bool = True
+    tool_id: str | None = None
+    server_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +140,8 @@ class ToolCallResult:
     raw_output: dict[str, Any] | None = None
     user_visible: bool = True
     policy_decision: dict[str, Any] | None = None
+    tool_id: str | None = None
+    server_name: str | None = None
 
 
 @dataclass(frozen=True)

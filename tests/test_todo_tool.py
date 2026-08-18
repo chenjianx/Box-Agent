@@ -251,46 +251,6 @@ async def test_set_rejects_status_only_progress_for_existing_list(writer):
 
 
 @pytest.mark.asyncio
-async def test_set_allows_status_change_with_substantive_priority_revision(writer):
-    initial = await writer.execute(
-        action="set",
-        todos=[
-            {"task": "Implement", "status": "in_progress", "priority": "low"},
-            {"task": "Verify", "status": "pending", "priority": "low"},
-        ],
-    )
-    current, next_item = initial.raw_output["items"]
-
-    result = await writer.execute(
-        action="set",
-        todos=[
-            {
-                "id": current["id"],
-                "task": current["task"],
-                "status": "completed",
-                "priority": "high",
-            },
-            {
-                "id": next_item["id"],
-                "task": next_item["task"],
-                "status": "in_progress",
-                "priority": "high",
-            },
-        ],
-    )
-
-    assert result.success
-    assert [item["status"] for item in result.raw_output["items"]] == [
-        "completed",
-        "in_progress",
-    ]
-    assert [item["priority"] for item in result.raw_output["items"]] == [
-        "high",
-        "high",
-    ]
-
-
-@pytest.mark.asyncio
 async def test_set_rejects_existing_task_without_canonical_id(writer):
     initial = await writer.execute(
         action="set",
@@ -320,7 +280,7 @@ async def test_set_rejects_existing_task_without_canonical_id(writer):
 
 
 @pytest.mark.asyncio
-async def test_set_uses_ids_as_identity_when_tasks_are_swapped(writer):
+async def test_set_rejects_existing_task_with_another_todo_id(writer):
     initial = await writer.execute(
         action="set",
         todos=[
@@ -338,39 +298,9 @@ async def test_set_uses_ids_as_identity_when_tasks_are_swapped(writer):
         ],
     )
 
-    assert result.success
-    assert [item["id"] for item in result.raw_output["items"]] == ["2", "1"]
-    assert [item["task"] for item in result.raw_output["items"]] == [
-        "First",
-        "Second",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_set_allows_new_duplicate_task_after_existing_id_is_preserved(writer):
-    initial = await writer.execute(
-        action="set",
-        todos=[{"task": "Run tests", "status": "in_progress"}],
-    )
-
-    result = await writer.execute(
-        action="set",
-        todos=[
-            {
-                "id": initial.raw_output["items"][0]["id"],
-                "task": "Run tests",
-                "status": "in_progress",
-            },
-            {"task": "Run tests", "status": "pending"},
-        ],
-    )
-
-    assert result.success
-    assert [item["id"] for item in result.raw_output["items"]] == ["1", "2"]
-    assert [item["task"] for item in result.raw_output["items"]] == [
-        "Run tests",
-        "Run tests",
-    ]
+    assert not result.success
+    assert "must preserve its original id (#1), not #2" in result.error
+    assert writer._store.list() == initial.raw_output["items"]
 
 
 @pytest.mark.asyncio
