@@ -28,6 +28,8 @@ from box_agent.tools.mcp_loader import (
     cleanup_mcp_connections,
     get_mcp_timeout_config,
     load_mcp_tools_async,
+    McpServerStatus,
+    reconnect_auth_failed_mcp_servers_if_token_changed,
     set_mcp_timeout_config,
 )
 from box_agent.tools.setup import merge_mcp_tools, register_mcp_tools
@@ -37,6 +39,65 @@ from box_agent.tools.base import Tool, ToolResult
 def test_streamable_http_client_is_available():
     """The loader resolves the client exported by the installed MCP SDK."""
     assert callable(mcp_loader.streamable_http_client)
+
+
+@pytest.mark.asyncio
+async def test_auth_refresh_reconnects_structured_401_and_403_failures(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(mcp_loader, "_mcp_auth_token", "old-token")
+    monkeypatch.setattr(mcp_loader, "_mcp_auth_file", "")
+    monkeypatch.setattr(mcp_loader, "_mcp_auth_fingerprint", "old-fingerprint")
+    monkeypatch.setattr(
+        mcp_loader,
+        "_mcp_status",
+        {
+            "unauthenticated": McpServerStatus(
+                name="unauthenticated",
+                state="failed",
+                auth_status=401,
+            ),
+            "forbidden": McpServerStatus(
+                name="forbidden",
+                state="failed",
+                auth_status=403,
+            ),
+            "timeout": McpServerStatus(
+                name="timeout",
+                state="failed",
+                error="connection timeout",
+            ),
+        },
+    )
+    monkeypatch.setattr(mcp_loader, "resolve_auth_token", lambda *_args, **_kwargs: "new-token")
+
+    async def reconnect(name: str) -> dict:
+        calls.append(name)
+        return {"success": True}
+
+    monkeypatch.setattr(mcp_loader, "reconnect_mcp_server", reconnect)
+
+    result = await reconnect_auth_failed_mcp_servers_if_token_changed()
+
+    assert calls == ["unauthenticated", "forbidden"]
+    assert result == [
+        {"name": "unauthenticated", "success": True},
+        {"name": "forbidden", "success": True},
+    ]
+    assert await reconnect_auth_failed_mcp_servers_if_token_changed() == []
+
+
+def test_recorded_auth_status_is_exposed_without_parsing_at_retry_time(monkeypatch):
+    monkeypatch.setattr(mcp_loader, "_mcp_status", {})
+
+    mcp_loader._record_status(
+        "hosted",
+        "failed",
+        error="Authorization failed: Access denied (HTTP 403)",
+    )
+
+    status = mcp_loader.get_mcp_status()[0]
+    assert status["authStatus"] == 403
+    assert mcp_loader._mcp_status["hosted"].auth_status == 403
 
 
 def test_streamable_http_client_has_supported_signature():
@@ -398,6 +459,48 @@ class TestMCPToolExecution:
         await release_browser_runtime(owner_a)
         await asyncio.wait_for(waiting, timeout=0.5)
         await release_browser_runtime(owner_b)
+
+    @pytest.mark.asyncio
+    async def test_playwright_snapshot_releases_turn_lease(self):
+        owner_a = "session-a:turn-1"
+        owner_b = "session-b:turn-1"
+
+        class FakeSession:
+            async def call_tool(self, name, arguments):
+                return SimpleNamespace(
+                    content=[SimpleNamespace(text=f"{name} complete")],
+                    isError=False,
+                )
+
+        owner_token = set_browser_runtime_owner(owner_a)
+        try:
+            navigate = MCPTool(
+                name="browser_navigate",
+                description="navigate",
+                parameters={"type": "object"},
+                session=FakeSession(),
+                server_name="playwright",
+                execute_timeout=1,
+            )
+            snapshot = MCPTool(
+                name="browser_snapshot",
+                description="snapshot",
+                parameters={"type": "object"},
+                session=FakeSession(),
+                server_name="playwright",
+                execute_timeout=1,
+            )
+
+            assert (await navigate.execute(url="https://example.com")).success
+            waiting = asyncio.create_task(BrowserRuntimeCoordinator.acquire(owner_b))
+            await asyncio.sleep(0)
+            assert waiting.done() is False
+
+            assert (await snapshot.execute()).success
+            await asyncio.wait_for(waiting, timeout=0.5)
+            await release_browser_runtime(owner_b)
+        finally:
+            reset_browser_runtime_owner(owner_token)
 
     @pytest.mark.asyncio
     async def test_playwright_call_timeout_is_not_reported_as_runtime_busy(self):
@@ -768,6 +871,7 @@ class TestMCPServerConnectionTimeout:
 
         assert await conn.connect() is False
         assert conn.last_error == "Connection timed out after 0.02s during open-stdio-transport"
+        assert conn.last_auth_status is None
 
         stderr = capsys.readouterr().err
         assert "[mcp] connect:start server='slow-stdio' transport=stdio" in stderr
@@ -841,6 +945,7 @@ class TestMCPServerConnectionTimeout:
 
         assert await conn.connect() is False
         assert conn.last_error == expected_error
+        assert conn.last_auth_status == (401 if "401" in expected_error else 403)
         assert conn.exit_stack is None
         assert conn.session is None
 

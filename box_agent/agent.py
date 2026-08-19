@@ -55,6 +55,7 @@ from .tools.mcp_tool_search import (
     ToolSearchTool,
 )
 from .tools.skill_preload import build_active_skills_prompt
+from .tool_result_storage import ToolResultStorage
 from .utils import calculate_display_width
 from .workflow_policy import WorkflowPolicy
 
@@ -75,6 +76,7 @@ class AgentRunOptions:
     """
 
     llm: Any
+    summary_llm: Any | None = None
     is_cancelled: Callable[[], bool] | None = None
     logger: AgentLogger | None = None
     permission_negotiator: Any | None = None
@@ -281,6 +283,9 @@ class _GoalReadTool(Tool):
     @property
     def parameters(self) -> dict:
         return {"type": "object", "properties": {}}
+
+    def compaction_state(self) -> tuple[str, str]:
+        return "Goal", json.dumps(_goal_snapshot(self._agent), ensure_ascii=False)
 
     async def execute(self) -> ToolResult:
         goal = self._agent.goal
@@ -520,6 +525,9 @@ class Agent:
                 self.activated_mcp_tools,
                 protected_names_provider=lambda: frozenset(self.tools),
             )
+        self.tool_result_storage = ToolResultStorage(
+            Path.home() / ".box-agent" / "sessions"
+        )
         self.token_limit = token_limit
         self.workspace_dir = Path(workspace_dir)
         self.cancel_event: Optional[asyncio.Event] = None
@@ -539,7 +547,11 @@ class Agent:
             workspace_info = (
                 f"\n\n## Current Workspace\n"
                 f"You are currently working in: `{self.workspace_dir.absolute()}`\n"
-                f"All relative paths will be resolved relative to this directory."
+                "This directory is the session workspace and filesystem safety "
+                "boundary. Relative tool paths resolve from each tool's active "
+                "project/artifact root; in output mode, prefer the artifact-relative "
+                "paths named by the active Skill or checkpoint instead of deriving "
+                "absolute paths from this workspace."
             )
             system_prompt = system_prompt + workspace_info
 
@@ -841,6 +853,7 @@ class Agent:
         """Return a complete snapshot of the default integration options."""
         return AgentRunOptions(
             llm=self.llm,
+            summary_llm=None,
             is_cancelled=self._check_cancelled,
             logger=self.logger,
             permission_negotiator=self._permission_negotiator,
@@ -899,6 +912,7 @@ class Agent:
 
         async for event in run_agent_loop(
             llm=effective_options.llm,
+            summary_llm=effective_options.summary_llm,
             messages=self.messages,
             tools=self.tools,
             max_steps=self.max_steps,
@@ -945,6 +959,7 @@ class Agent:
             context_resource_ledger=self.context_resource_ledger,
             context_resource_dedup_enabled=self.context_resource_dedup_enabled,
             tool_exposure_manager=self.mcp_tool_exposure,
+            tool_result_storage=self.tool_result_storage,
         ):
             # Track token usage on Agent instance for backward compat
             if isinstance(event, TokenUsageEvent):

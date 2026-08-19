@@ -65,11 +65,21 @@ simple factual lookup, one-source Q&A, or ordinary code changes.
 
 - Inspect the real provided files, logs, repo paths, or source artifacts before
   explaining behavior or generating conclusions.
-- Save every research artifact under `research/`, relative to the current
-  working/artifact root; create the directory before writing.
-- In officev3 session-output mode, the current working directory is already the
-  artifact root whose host path ends in `output/`. Never prepend another
-  `output/` segment (for example, do not use `$(pwd)/output/research`).
+- Save every research artifact with an artifact-root-relative `research/...`
+  tool path; create that directory before writing.
+- Reserved research artifact templates override the generic hyphen-separated
+  filename style. Keep hyphens inside `{topic}`, but join every reserved suffix
+  with the literal underscore shown in the template. For topic
+  `ai-quality-scheduling`, write `ai-quality-scheduling_dim01.md` and
+  `ai-quality-scheduling_cross_verification.md`; never write
+  `ai-quality-scheduling-dim01.md` or
+  `ai-quality-scheduling-cross_verification.md`. Copy the Required Outputs
+  filenames exactly for every dimension and handoff artifact.
+- In officev3 session-output mode, file tools and the shell use the active
+  artifact root whose host path ends in `output/`. The displayed session
+  workspace is the filesystem safety boundary, not the base for durable output.
+  Never derive an absolute research path from it or prepend another `output/`
+  segment (for example, do not use `$(pwd)/output/research`).
 - Never save research artifacts directly in the current working/artifact root.
 - Avoid CLI-specific assumptions. Use only tools actually available in the
   current host runtime.
@@ -129,7 +139,8 @@ simple factual lookup, one-source Q&A, or ordinary code changes.
 
 ## Start
 
-1. Treat the current working directory as `{workspace}` and the artifact root.
+1. Treat the host's active artifact root as `{workspace}` for durable outputs;
+   do not derive output paths from the displayed session workspace.
 2. Resolve `{skill_dir}` to the active installed directory containing this
    `SKILL.md`. Do not assume the current working directory is the skill
    directory.
@@ -183,7 +194,7 @@ Use [prompts.md](references/prompts.md) for subagent/local-round templates.
 
 ## Required Outputs
 
-All files live under `research/`, relative to the current working/artifact root.
+All files live under `research/`, relative to the active artifact root.
 
 | File | Route | Purpose |
 | --- | --- | --- |

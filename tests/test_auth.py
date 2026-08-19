@@ -15,7 +15,7 @@ from box_agent.auth import (
     resolve_auth_token,
     should_attach_auth_header,
 )
-from box_agent.config import Config
+from box_agent.config import Config, LLMConfig
 from box_agent.llm import AnthropicClient, OpenAIClient
 from box_agent.tools import mcp_loader
 
@@ -29,6 +29,12 @@ def test_resolve_auth_token_reads_supported_env(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.delenv("BOX_AGENT_AUTH_TOKEN", raising=False)
     monkeypatch.setenv("OFFICEV3_AUTH_TOKEN", "office-token")
     assert resolve_auth_token() == "office-token"
+
+
+def test_context_compaction_limit_uses_original_input_budget_formula() -> None:
+    config = LLMConfig(context_window=180_000, max_output_tokens=63_999)
+
+    assert config.context_token_limit == 104_400
 
 
 def test_resolve_auth_token_reads_auth_json_before_env(

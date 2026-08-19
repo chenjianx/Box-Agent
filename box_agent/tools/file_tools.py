@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import os
 import re
 import threading
@@ -133,6 +134,7 @@ class SearchFilesTool(EventEmittingTool):
 
     parallel_safe = True
     cancel_on_agent_cancel = True
+    max_result_size_chars = math.inf
 
     def __init__(
         self,
@@ -694,7 +696,11 @@ class WriteTool(Tool):
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute or relative path to the file",
+                    "description": (
+                        "Prefer a path relative to the active project/artifact root "
+                        f"({self.relative_root_dir}). Absolute paths are used exactly "
+                        "as supplied."
+                    ),
                 },
                 "content": {
                     "type": "string",

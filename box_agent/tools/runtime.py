@@ -43,6 +43,7 @@ class SkillRuntime:
 @dataclass(frozen=True)
 class SkillRuntimeContext:
     runtimes: dict[RuntimeKind, SkillRuntime]
+    sandbox_mode: bool = False
 
     def get(self, kind: RuntimeKind) -> SkillRuntime:
         return self.runtimes[kind]
@@ -66,6 +67,7 @@ def build_skill_runtime_context(
     """Discover runtimes available to skills for this session."""
     host_runtimes = _env_context_runtimes(env_context)
     return SkillRuntimeContext(
+        sandbox_mode=sandbox_mode,
         runtimes={
             "python": _build_python_runtime(
                 sandbox_mode,
@@ -110,8 +112,10 @@ def build_skill_runtime_prompt(ctx: SkillRuntimeContext) -> str:
             f"- Python: {python.provider}，标准 `python`/`python3` 已指向受管运行时"
             "（也可用 `$BOX_AGENT_PYTHON`）"
         )
-    else:
+    elif ctx.sandbox_mode:
         py_line = "- Python: 仅 `execute_code` 沙箱可用，无 shell python"
+    else:
+        py_line = "- Python: 本 session 不可用；不要调用 `execute_code` 或 shell python"
     if python.notes:
         py_line += f" — {'; '.join(python.notes)}"
     lines.append(py_line)

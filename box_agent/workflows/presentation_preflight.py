@@ -38,7 +38,8 @@ _CREATE_PRESENTATION_RE: Final[re.Pattern[str]] = re.compile(
     r"create|generate|make|build|produce|draft|remake)"
     r"(?!\s*的)"
     r"[^，。；;.!?\n]{0,48}"
-    r"(?:pptx?|powerpoint|演示文稿|幻灯片|slide\s+deck|slides?|presentation)",
+    r"(?:pptx?|powerpoint|演示文稿|幻灯片|slide\s+deck|slides?|presentation|"
+    r"融资\s*bp|商业计划书|pitch\s+deck)",
     re.IGNORECASE,
 )
 _EXPORT_PRESENTATION_RE: Final[re.Pattern[str]] = re.compile(
@@ -63,10 +64,12 @@ _REQUEST_NEW_RE: Final[re.Pattern[str]] = re.compile(
     r"\s*(?:(?:做|制作|生成|创建|出|来)\s*)?"
     r"(?:一份|一个|一版|个|份)?"
     r"[^，。；;.!?\n]{0,40}?"
-    r"(?:pptx?|powerpoint|演示文稿|幻灯片|slide\s+deck|slides?|presentation)"
+    r"(?:pptx?|powerpoint|演示文稿|幻灯片|slide\s+deck|slides?|presentation|"
+    r"融资\s*bp|商业计划书|pitch\s+deck)"
     r"|(?:帮我\s*)?(?:出|来)\s*(?:一份|一个|一版|个|份)"
     r"[^，。；;.!?\n]{0,40}?"
-    r"(?:pptx?|powerpoint|演示文稿|幻灯片|slide\s+deck|slides?|presentation)",
+    r"(?:pptx?|powerpoint|演示文稿|幻灯片|slide\s+deck|slides?|presentation|"
+    r"融资\s*bp|商业计划书|pitch\s+deck)",
     re.IGNORECASE,
 )
 _NON_PRESENTATION_ARTIFACT_RE: Final[str] = (

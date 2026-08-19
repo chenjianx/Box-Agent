@@ -67,8 +67,8 @@ async def test_anthropic_request_no_thinking_by_default(monkeypatch):
 # ───────────────────────── OpenAI ─────────────────────────
 
 @pytest.mark.asyncio
-async def test_openai_request_keeps_generic_thinking_noop_when_enabled(monkeypatch):
-    """Generic OpenAI-compatible models keep the existing request shape."""
+async def test_openai_request_sends_high_reasoning_effort_when_enabled(monkeypatch):
+    """Generic OpenAI-compatible models receive high reasoning effort."""
     client = OpenAIClient(api_key="k", api_base="https://x.example", model="qwen")
 
     captured: dict = {}
@@ -89,7 +89,7 @@ async def test_openai_request_keeps_generic_thinking_noop_when_enabled(monkeypat
     )
 
     assert "extra_body" not in captured
-    assert "reasoning_effort" not in captured
+    assert captured["reasoning_effort"] == "high"
 
 
 @pytest.mark.asyncio
@@ -153,18 +153,18 @@ async def test_openai_request_no_extra_body_by_default(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("model", "thinking_enabled", "expects_sensenova_body"),
+    ("model", "thinking_enabled", "expected_mapping"),
     [
-        ("qwen", True, False),
-        ("SenseNova-Flash-Lite-test", False, False),
-        ("SenseNova-Flash-Lite-test", True, True),
-        ("sn-sensenova-6-8-flash-lite", True, True),
+        ("qwen", True, "reasoning_effort"),
+        ("SenseNova-Flash-Lite-test", False, "none"),
+        ("SenseNova-Flash-Lite-test", True, "sensenova"),
+        ("sn-sensenova-6-8-flash-lite", True, "sensenova"),
     ],
 )
-async def test_openai_stream_request_maps_sensenova_thinking(
+async def test_openai_stream_request_maps_thinking_to_provider_dialect(
     model,
     thinking_enabled,
-    expects_sensenova_body,
+    expected_mapping,
     monkeypatch,
 ):
     """Streaming requests use the same model-specific mapping as completions."""
@@ -210,7 +210,7 @@ async def test_openai_stream_request_maps_sensenova_thinking(
     ]
 
     assert [event.delta for event in events if event.type == "text"] == ["ok"]
-    if expects_sensenova_body:
+    if expected_mapping == "sensenova":
         assert captured["extra_body"] == {
             "chat_template_kwargs": {
                 "thinking": True,
@@ -219,7 +219,10 @@ async def test_openai_stream_request_maps_sensenova_thinking(
         }
     else:
         assert "extra_body" not in captured
-    assert "reasoning_effort" not in captured
+    if expected_mapping == "reasoning_effort":
+        assert captured["reasoning_effort"] == "high"
+    else:
+        assert "reasoning_effort" not in captured
 
 
 @pytest.mark.asyncio

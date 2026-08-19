@@ -157,6 +157,8 @@ def select_auto_model(
     required_tools: Iterable[str] = (),
     skills: Iterable[str] = (),
     files: Iterable[str] = (),
+    task_tags: Iterable[str] | None = None,
+    required_ability_level: int | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Choose one allowlisted model for an isolated child task."""
 
@@ -165,16 +167,32 @@ def select_auto_model(
         return None, {"mode": "inherit", "reason": "no_auto_model_pool"}
 
     file_names = list(files)
-    task_tags = _task_tags(
-        task,
-        required_tools=required_tools,
-        skills=skills,
-        files=file_names,
+    resolved_task_tags = (
+        sorted(
+            {
+                tag.strip().lower()
+                for tag in task_tags
+                if isinstance(tag, str) and tag.strip()
+            }
+        )
+        if task_tags is not None
+        else _task_tags(
+            task,
+            required_tools=required_tools,
+            skills=skills,
+            files=file_names,
+        )
     )
+    if not resolved_task_tags:
+        resolved_task_tags = ["general", "chat"]
     complex_task = bool(_COMPLEX_TASK_RE.search(task)) or (
         strategy == "general_loop" and bool(list(required_tools))
     )
-    required_ability = 2 if complex_task else 1
+    required_ability = (
+        required_ability_level
+        if isinstance(required_ability_level, int) and required_ability_level > 0
+        else 2 if complex_task else 1
+    )
     estimated_input_tokens = max(
         1,
         math.ceil(len(task) / 2) + min(len(file_names), 8) * 16_000,
@@ -205,7 +223,7 @@ def select_auto_model(
     if not ability_pool:
         ability_pool = context_pool
 
-    required_tags = set(task_tags)
+    required_tags = set(resolved_task_tags)
 
     def score(model: dict[str, Any]) -> int:
         tags = set(model.get("tags", ()))
@@ -222,7 +240,101 @@ def select_auto_model(
     return selected, {
         "mode": "auto",
         "selected_model": selected["model"],
-        "task_tags": task_tags,
+        "task_tags": resolved_task_tags,
         "required_ability_level": required_ability,
         "estimated_input_tokens": estimated_input_tokens,
     }
+
+
+def resolve_model_client(
+    llm: Any,
+    *,
+    task: str,
+    strategy: str = "utility",
+    required_tools: Iterable[str] = (),
+    skills: Iterable[str] = (),
+    files: Iterable[str] = (),
+    max_output_tokens_cap: int | None = None,
+    auto_model_candidates: Iterable[dict[str, Any]] | None = None,
+    task_tags: Iterable[str] | None = None,
+    required_ability_level: int | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Resolve one task client without violating the session routing mode.
+
+    A client exposes ``auto_model_candidates`` only when the host explicitly
+    selected automatic routing.  In that case the existing tag/ability/context
+    selector may clone an allowlisted candidate.  With no candidate pool the
+    current client is locked and is never switched to a different model.
+    """
+
+    candidates = (
+        auto_model_candidates
+        if auto_model_candidates is not None
+        else getattr(llm, "auto_model_candidates", ())
+    )
+    if not isinstance(candidates, (list, tuple)):
+        candidates = ()
+    selected, diagnostic = select_auto_model(
+        candidates,
+        task=task,
+        strategy=strategy,
+        required_tools=required_tools,
+        skills=skills,
+        files=files,
+        task_tags=task_tags,
+        required_ability_level=required_ability_level,
+    )
+    if selected is None and max_output_tokens_cap is None:
+        return llm, diagnostic
+
+    current_model = str(getattr(llm, "model", "") or "").strip()
+    target_model = str((selected or {}).get("model") or current_model).strip()
+    selected_limit = (selected or {}).get("maxTokens")
+    target_limit = selected_limit if isinstance(selected_limit, int) else None
+    if max_output_tokens_cap is not None:
+        if max_output_tokens_cap <= 0:
+            raise ValueError("max_output_tokens_cap must be positive")
+        target_limit = (
+            min(target_limit, max_output_tokens_cap)
+            if target_limit is not None
+            else max_output_tokens_cap
+        )
+
+    if not target_model:
+        return llm, {
+            **diagnostic,
+            "mode": "inherit",
+            "reason": "current_model_unavailable",
+        }
+
+    should_clone = selected is not None or max_output_tokens_cap is not None
+    if not should_clone:
+        return llm, diagnostic
+
+    clone_for_model = getattr(llm, "for_model", None)
+    if not callable(clone_for_model):
+        return llm, {
+            **diagnostic,
+            "mode": "inherit",
+            "reason": "model_clone_unavailable",
+        }
+    try:
+        return (
+            clone_for_model(target_model, max_output_tokens=target_limit),
+            {
+                **diagnostic,
+                "selected_model": target_model,
+                **(
+                    {"max_output_tokens": target_limit}
+                    if target_limit is not None
+                    else {}
+                ),
+            },
+        )
+    except (TypeError, ValueError) as exc:
+        return llm, {
+            **diagnostic,
+            "mode": "inherit",
+            "reason": "model_clone_failed",
+            "error": str(exc),
+        }

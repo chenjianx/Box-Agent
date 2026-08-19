@@ -102,6 +102,10 @@ also be the only shell command: do not append `tail`, `2>&1 | tail -N`, any othe
 pipe/redirection, or a second command. Registered layout ids and valid inspector
 flags shown above may remain; `--outline` and `--out` are required, not the only
 allowed inspector arguments.
+Use `cd <artifact-root> && ${BOX_AGENT_NODE:-node}` on that same line;
+do not split `cd` and the inspector across lines. When the current checkpoint supplies
+the absolute inspector path and the two allowed flags, copy that exact one-line
+form instead of reformatting it.
 
 The command writes the canonical skeleton, the required `image_plan` key in
 `assets/generated/manifest.json`, and `qa/deck_contract.json`; it refuses to
@@ -319,6 +323,10 @@ before scaffolding. Run this gate at the start of every new deck:
    Cover, agenda, and section-divider pages are structural and may keep
    `evidence: []`; framework data pages still need an explicit unavailable-data
    placeholder when no verified fact exists.
+   Removing numbers or rewriting a claim as qualitative prose does not verify it.
+   On every non-structural framework page that keeps a required unsupported claim,
+   the exact unavailable-data placeholder must appear in `message` or `bullets`; an empty
+   `evidence` array by itself is not disclosure.
    Never delay `index.html` for a research/source gap. Search and direct browser
    evidence calls have their own bounded research allowance and do not spend the
    downstream deck-production budget. Once that report allows delivery, obey

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -12,7 +12,6 @@ from ...context_resources import (
     ResourceDescriptor,
     classify_read_resource,
 )
-from ...model_history import is_model_instruction_source_path
 from ..base import Tool, ToolResult
 from ..file_tools import _binary_file_error, _resolve_from_active_root
 from ..safety import validate_path_in_workspace
@@ -21,9 +20,6 @@ if TYPE_CHECKING:
     from ..permissions import PermissionEngine
 
 
-_MODEL_CONTEXT_EXTS = {".html", ".htm", ".json", ".md", ".txt", ".log", ".xml"}
-_MODEL_CONTEXT_PATH_PARTS = {"qa", "rendered", "slides", "vision_inputs"}
-_MODEL_CONTEXT_SIZE_THRESHOLD = 8_000
 DEFAULT_READ_LIMIT = 500
 MAX_READ_LINES = 2_000
 MAX_READ_CHARS = 100_000
@@ -88,110 +84,10 @@ def _similar_file_suggestions(file_path: Path, limit: int = 5) -> list[str]:
     return [str(candidate) for candidate in ranked[:limit] if score(candidate)[0] > 0]
 
 
-def _strip_number_prefix(line: str) -> str:
-    """Remove the read_file line-number prefix from one formatted line."""
-    if "|" not in line:
-        return line
-    prefix, rest = line.split("|", 1)
-    return rest if prefix.strip().isdigit() else line
-
-
-def _cap_preview_lines(lines: list[str], max_chars: int = 1200) -> list[str]:
-    """Keep preview snippets useful without retaining a large artifact body."""
-    capped: list[str] = []
-    used = 0
-    for line in lines:
-        remaining = max_chars - used
-        if remaining <= 0:
-            break
-        if len(line) > remaining:
-            capped.append(line[:remaining] + "...")
-            used = max_chars
-            break
-        capped.append(line)
-        used += len(line)
-    return capped
-
-
-def _looks_like_generated_artifact(file_path: Path, content: str) -> bool:
-    """Return true for files that should not be retained verbatim in model history."""
-    if is_model_instruction_source_path(file_path):
-        return False
-    suffix = file_path.suffix.lower()
-    if suffix in {".html", ".htm"}:
-        return True
-    if suffix in {".json", ".log"} and any(part in _MODEL_CONTEXT_PATH_PARTS for part in file_path.parts):
-        return True
-    if any(part in _MODEL_CONTEXT_PATH_PARTS for part in file_path.parts) and suffix in _MODEL_CONTEXT_EXTS:
-        return True
-    return len(content) > _MODEL_CONTEXT_SIZE_THRESHOLD and suffix in _MODEL_CONTEXT_EXTS
-
-
-def _summarize_json_for_model(raw_text: str) -> list[str]:
-    """Extract a small, useful JSON summary without keeping the full payload."""
-    try:
-        data = json.loads(raw_text)
-    except json.JSONDecodeError:
-        return []
-
-    lines: list[str] = []
-    if isinstance(data, dict):
-        keys = list(data.keys())
-        lines.append(f"top_level_keys: {', '.join(map(str, keys[:20]))}")
-        for key in ("ok", "success", "status", "error", "errors", "warning", "warnings", "slideCount", "slide_count"):
-            if key in data:
-                value = data[key]
-                preview = json.dumps(value, ensure_ascii=False)
-                if len(preview) > 500:
-                    preview = preview[:500] + "..."
-                lines.append(f"{key}: {preview}")
-    elif isinstance(data, list):
-        lines.append(f"array_length: {len(data)}")
-        if data:
-            preview = json.dumps(data[0], ensure_ascii=False)
-            if len(preview) > 500:
-                preview = preview[:500] + "..."
-            lines.append(f"first_item: {preview}")
-    return lines
-
-
-def build_read_file_model_context(file_path: Path, content: str, total_lines: int) -> str | None:
-    """Build a compact model-history substitute for generated or QA artifacts."""
-    if not _looks_like_generated_artifact(file_path, content):
-        return None
-
-    raw_lines = [_strip_number_prefix(line) for line in content.splitlines()]
-    raw_text = "\n".join(raw_lines)
-    suffix = file_path.suffix.lower()
-    summary_lines = [
-        "[Full file content omitted from model history]",
-        f"Tool: read_file",
-        f"Path: {file_path}",
-        f"Type: {suffix or 'unknown'}",
-        f"Lines: {total_lines}",
-        f"Characters: {len(raw_text)}",
-        "Reason: generated/QA artifact content can bloat future LLM turns; read the file again with offset/limit if exact content is needed.",
-    ]
-
-    if suffix == ".json":
-        json_summary = _summarize_json_for_model(raw_text)
-        if json_summary:
-            summary_lines.append("")
-            summary_lines.append("JSON summary:")
-            summary_lines.extend(f"- {line}" for line in json_summary)
-
-    preview_limit = 20 if suffix not in {".html", ".htm"} else 12
-    preview = _cap_preview_lines(raw_lines[:preview_limit])
-    if preview:
-        summary_lines.append("")
-        summary_lines.append(f"Preview first {len(preview)} lines:")
-        summary_lines.extend(preview)
-
-    return "\n".join(summary_lines)
-
-
 class ReadTool(Tool):
     """Read file content."""
+
+    max_result_size_chars = math.inf
 
     def __init__(
         self,
@@ -414,7 +310,6 @@ class ReadTool(Tool):
                     f"of {total_lines}. Use offset={next_offset}, limit={limit} to continue.]"
                 )
 
-            model_context = build_read_file_model_context(file_path, content, total_lines)
             descriptor = ResourceDescriptor(
                 resource_id=str(file_path.resolve()),
                 content_version=content_hasher.hexdigest(),
@@ -429,7 +324,6 @@ class ReadTool(Tool):
             return ToolResult(
                 success=True,
                 content=content,
-                model_context=model_context,
                 raw_output={
                     "source_char_count": source_char_count,
                     "selected_char_count": selected_char_count,

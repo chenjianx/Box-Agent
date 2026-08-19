@@ -107,3 +107,12 @@ def test_system_prompt_separates_user_decisions_from_missing_input():
     assert "不要只在普通文本里列方案并等待回复" in prompt
     assert "内部实现和恢复策略应自行选择" in prompt
     assert "最终是否允许由运行时决定" in prompt
+
+
+def test_system_prompt_checks_explicit_requirements_before_claiming_completion():
+    prompt = Path("box_agent/config/system_prompt.md").read_text(encoding="utf-8")
+
+    assert "产物文件存在不等于用户要求已经满足" in prompt
+    assert "逐项核对用户明确要求的内容、数据、时效和格式" in prompt
+    assert "搜索链接、占位符或“请自行查看”不能冒充已取得的实时结果" in prompt
+    assert "明确标记未完成及其证据缺口，不得宣称任务已完成" in prompt

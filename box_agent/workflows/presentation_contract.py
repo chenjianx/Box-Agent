@@ -14,6 +14,9 @@ PRESENTATION_DELIVERY_KEYWORDS: Final[tuple[str, ...]] = (
     "slide deck",
     "slides",
     "presentation",
+    "融资bp",
+    "商业计划书",
+    "pitch deck",
 )
 CHECKPOINT_MARKER: Final[str] = "CONTROLLED_PRESENTATION_STAGE="
 RESEARCH_MODE_OPTION: Final[str] = "research_mode"

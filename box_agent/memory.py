@@ -24,6 +24,8 @@ from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Iterator
 
+from .llm.model_routing import resolve_model_client
+
 if TYPE_CHECKING:
     from .schema import Message
 
@@ -1214,7 +1216,14 @@ class MemoryManager:
         )
 
         try:
-            response = await llm.generate(
+            memory_llm, _ = resolve_model_client(
+                llm,
+                task="从外部笔记中提炼长期用户记忆",
+                strategy="utility",
+                task_tags=("summary", "analysis"),
+                required_ability_level=1,
+            )
+            response = await memory_llm.generate(
                 messages=[
                     Msg(role="system", content="You extract structured user information from raw notes."),
                     Msg(role="user", content=prompt),
@@ -1291,7 +1300,14 @@ class MemoryManager:
         )
 
         try:
-            response = await llm.generate(
+            memory_llm, _ = resolve_model_client(
+                llm,
+                task="分析并合并长期上下文记忆",
+                strategy="utility",
+                task_tags=("summary", "analysis"),
+                required_ability_level=1,
+            )
+            response = await memory_llm.generate(
                 messages=[
                     Msg(role="system", content=_CONTEXT_UPDATE_SYSTEM_PROMPT),
                     Msg(role="user", content=prompt),
@@ -1590,7 +1606,14 @@ class MemoryManager:
         )
 
         try:
-            response = await llm.generate(
+            memory_llm, _ = resolve_model_client(
+                llm,
+                task="分析记忆候选并生成晋升摘要",
+                strategy="utility",
+                task_tags=("summary", "analysis"),
+                required_ability_level=1,
+            )
+            response = await memory_llm.generate(
                 messages=[
                     {"role": "system", "content": _PROMOTION_PLAN_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
@@ -2375,7 +2398,14 @@ class MemoryExtractor:
             transcript=transcript,
         )
 
-        response = await self._llm.generate(
+        memory_llm, _ = resolve_model_client(
+            self._llm,
+            task="从会话中分析提炼长期记忆",
+            strategy="utility",
+            task_tags=("summary", "analysis"),
+            required_ability_level=1,
+        )
+        response = await memory_llm.generate(
             messages=[
                 Msg(role="system", content=_EXTRACTION_SYSTEM_PROMPT),
                 Msg(role="user", content=prompt),

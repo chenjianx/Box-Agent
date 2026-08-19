@@ -8429,8 +8429,41 @@ def test_outline_accepts_framework_structural_pages_without_evidence(
     ) == 2
 
 
-def test_outline_framework_data_page_still_requires_gap_or_evidence(
+@pytest.mark.parametrize(
+    ("title", "message", "bullets", "notes"),
+    [
+        (
+            "市场规模",
+            "展示新能源汽车销量与渗透率。",
+            ["梳理市场趋势", "比较品牌表现"],
+            "",
+        ),
+        (
+            "市场规模",
+            "市场规模待补充。",
+            ["销量待补充", "渗透率待补充"],
+            "",
+        ),
+        (
+            "暂无可验证公开数据",
+            "展示新能源汽车销量与渗透率。",
+            ["梳理市场趋势", "比较品牌表现"],
+            "",
+        ),
+        (
+            "市场规模",
+            "展示新能源汽车销量与渗透率。",
+            ["梳理市场趋势", "比较品牌表现"],
+            "暂无可验证公开数据",
+        ),
+    ],
+)
+def test_outline_framework_data_page_still_requires_exact_gap_or_evidence(
     tmp_path: Path,
+    title: str,
+    message: str,
+    bullets: list[str],
+    notes: str,
 ) -> None:
     outline_path = tmp_path / "outline.json"
     outline = _write_outline(outline_path, page_count=2)
@@ -8439,8 +8472,10 @@ def test_outline_framework_data_page_still_requires_gap_or_evidence(
     )
     outline["slides"][1].update(
         {
-            "title": "市场规模",
-            "message": "展示新能源汽车销量与渗透率。",
+            "title": title,
+            "message": message,
+            "bullets": bullets,
+            "notes": notes,
             "layout": "kpi-grid",
             "visual": "KPI 指标卡",
             "evidence": [],
@@ -8477,7 +8512,7 @@ def test_outline_framework_data_page_still_requires_gap_or_evidence(
     assert result.returncode == 1
     payload = json.loads(result.stdout)
     assert any(
-        issue.startswith("slide-02: entity-bound research handoff")
+        issue.startswith("slide-02: framework research page")
         for issue in payload["issues"]
     )
 
@@ -11702,8 +11737,17 @@ def test_no_image_instruction_blocks_technical_cover_generation_and_is_qa_enforc
     assert "generation_forbidden" in rejected.stdout
 
 
+@pytest.mark.parametrize(
+    ("policy", "decision_reason"),
+    [
+        ("forbidden", "the user explicitly forbids images for this presentation"),
+        ("unavailable", "image generation service unavailable"),
+    ],
+)
 def test_rebase_image_policy_converts_existing_required_media_deck_idempotently(
     tmp_path: Path,
+    policy: str,
+    decision_reason: str,
 ) -> None:
     outline_path = tmp_path / "outline.json"
     outline = _write_outline(
@@ -11759,6 +11803,12 @@ def test_rebase_image_policy_converts_existing_required_media_deck_idempotently(
         json.dumps(deck, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    original_deck = json.loads(deck_path.read_text(encoding="utf-8"))
+    original_manifest = json.loads(
+        (tmp_path / "assets" / "generated" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
 
     rebased = _run(
         "rebase_image_policy.js",
@@ -11766,7 +11816,7 @@ def test_rebase_image_policy_converts_existing_required_media_deck_idempotently(
         "--manifest",
         "assets/generated/manifest.json",
         "--policy",
-        "forbidden",
+        policy,
         cwd=tmp_path,
         env=env,
     )
@@ -11775,10 +11825,22 @@ def test_rebase_image_policy_converts_existing_required_media_deck_idempotently(
 
     manifest_path = tmp_path / "assets" / "generated" / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["generation_forbidden"] is True
+    assert manifest["generation_forbidden"] is (policy == "forbidden")
     assert all(item["decision"] == "skip" for item in manifest["image_plan"])
     assert all(item["status"] == "skipped" for item in manifest["image_plan"])
     assert all(item["required"] is False for item in manifest["image_plan"])
+    assert all(
+        item["decision_reason"] == decision_reason for item in manifest["image_plan"]
+    )
+    if policy == "unavailable":
+        assert manifest["image_generation_unavailable"] is True
+        recovery = manifest["image_unavailable_recovery"]
+        assert recovery["schema_version"] == 1
+        assert recovery["deck"] == original_deck
+        assert recovery["image_plan"] == original_manifest["image_plan"]
+    else:
+        assert "image_generation_unavailable" not in manifest
+        assert "image_unavailable_recovery" not in manifest
 
     rebased_deck = json.loads(deck_path.read_text(encoding="utf-8"))
     assert rebased_deck["slides"][1]["layout_id"] == "statement-focus-v1"
@@ -11793,7 +11855,7 @@ def test_rebase_image_policy_converts_existing_required_media_deck_idempotently(
         "--manifest",
         "assets/generated/manifest.json",
         "--policy",
-        "forbidden",
+        policy,
         cwd=tmp_path,
         env=env,
     )
@@ -11825,6 +11887,27 @@ def test_rebase_image_policy_converts_existing_required_media_deck_idempotently(
     )
     assert rendered.returncode == 0, rendered.stdout + rendered.stderr
     assert (tmp_path / "index.html").is_file()
+
+    if policy == "unavailable":
+        restored = _run(
+            "rebase_image_policy.js",
+            "deck.json",
+            "--manifest",
+            "assets/generated/manifest.json",
+            "--policy",
+            "retry",
+            cwd=tmp_path,
+            env=env,
+        )
+        assert restored.returncode == 0, restored.stdout + restored.stderr
+        assert json.loads(restored.stdout)["changed"] is True
+        assert json.loads(deck_path.read_text(encoding="utf-8")) == original_deck
+        restored_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert restored_manifest["image_plan"] == original_manifest["image_plan"]
+        assert restored_manifest["generation_forbidden"] is False
+        assert "image_generation_unavailable" not in restored_manifest
+        assert "image_unavailable_recovery" not in restored_manifest
+        assert "image_service" not in restored_manifest
 
 
 def test_no_images_scaffold_uses_registered_required_media_fallback(

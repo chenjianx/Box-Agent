@@ -649,14 +649,14 @@ def _manifest_generation_progress(
 
 def _manifest_image_policy_state(
     manifest_path: Path,
-) -> tuple[bool, bool, bool]:
-    """Return generation-forbidden, needs-forbidden-rebase, and auth-blocked."""
+) -> tuple[bool, bool, bool, str | None, bool]:
+    """Return generation, rebase, auth, mode, and retry-recovery state."""
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return (False, False, False)
+        return (False, False, False, None, False)
     if not isinstance(payload, dict):
-        return (False, False, False)
+        return (False, False, False, None, False)
     generation_forbidden = payload.get("generation_forbidden") is True
     image_plan = payload.get("image_plan")
     needs_rebase = not generation_forbidden or not isinstance(image_plan, list)
@@ -676,7 +676,22 @@ def _manifest_image_policy_state(
         and image_service.get("status") == "blocked"
         and image_service.get("reason") == "authorization_401"
     )
-    return (generation_forbidden, needs_rebase, auth_blocked)
+    mode = payload.get("mode")
+    recovery = payload.get("image_unavailable_recovery")
+    unavailable_recoverable = bool(
+        payload.get("image_generation_unavailable") is True
+        and isinstance(recovery, dict)
+        and recovery.get("schema_version") == 1
+        and isinstance(recovery.get("deck"), dict)
+        and isinstance(recovery.get("image_plan"), list)
+    )
+    return (
+        generation_forbidden,
+        needs_rebase,
+        auth_blocked,
+        mode if isinstance(mode, str) else None,
+        unavailable_recoverable,
+    )
 
 
 def _json_document_error(path: Path) -> str | None:
@@ -1440,10 +1455,20 @@ def build_checkpoint_text(
         "rebase_image_policy.js",
         "deck.json --manifest assets/generated/manifest.json --policy forbidden",
     )
+    rebase_unavailable_image_policy_command = _controlled_pptx_command(
+        "rebase_image_policy.js",
+        "deck.json --manifest assets/generated/manifest.json --policy unavailable",
+    )
+    restore_unavailable_image_policy_command = _controlled_pptx_command(
+        "rebase_image_policy.js",
+        "deck.json --manifest assets/generated/manifest.json --policy retry",
+    )
     (
         manifest_generation_forbidden,
         manifest_needs_forbidden_rebase,
         manifest_auth_blocked,
+        manifest_image_mode,
+        manifest_unavailable_recoverable,
     ) = _manifest_image_policy_state(manifest_path)
     effective_image_generation_forbidden = (
         image_generation_policy == IMAGE_GENERATION_FORBIDDEN
@@ -1588,13 +1613,19 @@ def build_checkpoint_text(
             )
             next_action = (
                 "The bounded search rounds already returned candidate sources, so do "
-                "not call web_search again. "
+                "not call web_search again. This ends only the search-query discovery "
+                "phase; it does not stop the task or prohibit direct reading of "
+                "already-discovered candidate URLs. Do not describe this checkpoint "
+                "to the user as a stop or cancel instruction. "
                 + direct_read_instruction
                 + "Do not create outline.json before writing the fresh research "
                 "handoff report. Do not inspect/list files or reread skill "
-                "references, validator source, or Markdown research notes. Use only "
-                "the evidence already present in model context and research/ to "
-                "finish the route's cross-verification, "
+                "references, validator source, or Markdown research notes. Use the "
+                "candidate URLs and evidence already present in model context and "
+                "research/ to finish the route's cross-verification; successful "
+                "exact-page content obtained during the allowed direct-read phase may "
+                "be added to the ledger. Do not introduce evidence from new search "
+                "queries. Finish the route's "
                 "insight, structured evidence ledger, and fresh "
                 "research/qa/*_research_check.json via "
                 "validate_research_artifacts.py --report. The report may hand off a "
@@ -1796,7 +1827,11 @@ def build_checkpoint_text(
                 "content claims. Cover, agenda, and section-divider pages are "
                 "structural and may keep evidence empty. Every other public-research "
                 "page must include at least one evidence item unless it explicitly "
-                "marks a required fact as unavailable; every non-empty item must "
+                "marks a required fact as unavailable. Removing numeric literals or "
+                "rewriting unsupported claims as qualitative prose does not make "
+                "them verified. For a required unsupported fact, put the exact "
+                "placeholder 暂无可验证公开数据 in that page's message or bullets. "
+                "Every non-empty item must "
                 "include the actual http(s) "
                 "source URL used for that claim. "
                 "Treat AuthLevel as a ranking hint, not proof of authority: when "
@@ -1855,6 +1890,8 @@ def build_checkpoint_text(
                 "registry, or invent an id. Your very next tool call must invoke "
                 "inspect_deck_contract.js once to create deck.json and its image "
                 "manifest, passing only `--outline outline.json --out deck.json`. "
+                "Invoke it on one physical command line using `cd <artifact-root> &&`; "
+                "do not split `cd` and the inspector across lines. "
                 "Do not pass layout ids, --theme, --image-mode, --title, facts, or "
                 "other optional flags; the inspector deterministically derives the "
                 "ordered layout plan and theme from the validated outline. The "
@@ -1896,6 +1933,19 @@ def build_checkpoint_text(
                 patch_needs_apply = False
 
         if (
+            image_generation_policy == IMAGE_GENERATION_EXPLICIT_RETRY
+            and manifest_unavailable_recoverable
+        ):
+            stage = "image_policy_rebase"
+            next_action = (
+                "The user explicitly requested image generation again after a "
+                "temporary service failure. Run exactly one bash tool call: `"
+                f"{restore_unavailable_image_policy_command}`. The deterministic "
+                "helper restores the original image plan and media layouts, clears "
+                "the persisted authorization failure, and resumes image generation. "
+                "Do not edit deck.json or manifest.json yourself."
+            )
+        elif (
             effective_image_generation_forbidden
             and manifest_path.is_file()
             and manifest_needs_forbidden_rebase
@@ -1912,7 +1962,26 @@ def build_checkpoint_text(
             )
         elif (
             manifest_auth_blocked
+            and manifest_image_mode == "auto"
+            and not manifest_generation_forbidden
+            and not manifest_unavailable_recoverable
+            and image_generation_policy != IMAGE_GENERATION_EXPLICIT_RETRY
+        ):
+            stage = "image_policy_rebase"
+            next_action = (
+                "Image generation authorization failed, but this deck uses auto "
+                "image mode, so images are optional. Run exactly one bash tool call: `"
+                f"{rebase_unavailable_image_policy_command}`. The deterministic "
+                "helper records service-unavailable provenance, removes pending "
+                "media requirements, switches required-media layouts to registered "
+                "no-image fallbacks, and lets authoring/finalization continue. Do "
+                "not call generate_image again or edit deck.json/manifest.json "
+                "yourself."
+            )
+        elif (
+            manifest_auth_blocked
             and not effective_image_generation_forbidden
+            and not manifest_unavailable_recoverable
             and image_generation_policy != IMAGE_GENERATION_EXPLICIT_RETRY
         ):
             stage = "image_auth_blocked"

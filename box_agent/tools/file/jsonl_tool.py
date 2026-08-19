@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -190,6 +191,7 @@ class JsonlQueryTool(ReadTool):
     """Stream, filter, and project JSONL records without exposing raw large lines."""
 
     parallel_safe = True
+    max_result_size_chars = math.inf
 
     @property
     def name(self) -> str:

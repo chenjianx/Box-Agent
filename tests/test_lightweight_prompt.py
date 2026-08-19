@@ -219,6 +219,8 @@ class _StubAgent:
 
     extMethod = BoxACPAgent.extMethod
     _llm_prompt = BoxACPAgent._llm_prompt
+    _llm_for_binding = BoxACPAgent._llm_for_binding
+    _utility_llm_for_meta = BoxACPAgent._utility_llm_for_meta
 
 
 @pytest.mark.asyncio

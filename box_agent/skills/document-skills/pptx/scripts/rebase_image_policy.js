@@ -16,7 +16,7 @@ const {
 function usage(message) {
   if (message) console.error(message);
   console.error(
-    "Usage: rebase_image_policy.js deck.json --manifest assets/generated/manifest.json --policy forbidden"
+    "Usage: rebase_image_policy.js deck.json --manifest assets/generated/manifest.json --policy forbidden|unavailable|retry"
   );
   process.exit(2);
 }
@@ -38,7 +38,9 @@ function parseArgs(argv) {
     }
   }
   if (!opts.manifest) usage("--manifest is required");
-  if (opts.policy !== "forbidden") usage("--policy must be forbidden");
+  if (!["forbidden", "unavailable", "retry"].includes(opts.policy)) {
+    usage("--policy must be forbidden, unavailable, or retry");
+  }
   return opts;
 }
 
@@ -50,6 +52,52 @@ function writeAtomic(filePath, content) {
   const tempPath = `${filePath}.tmp-${process.pid}`;
   fs.writeFileSync(tempPath, content, "utf8");
   fs.renameSync(tempPath, filePath);
+}
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function restoreUnavailablePolicy(deckPath, manifestPath, deckBefore, manifestBefore, manifest) {
+  const recovery = manifest.image_unavailable_recovery;
+  if (
+    !recovery
+    || recovery.schema_version !== 1
+    || !recovery.deck
+    || typeof recovery.deck !== "object"
+    || !Array.isArray(recovery.image_plan)
+  ) {
+    throw new Error("No recoverable unavailable image policy state was found.");
+  }
+  const validation = validateAndNormalizeDeck(cloneJson(recovery.deck));
+  if (!validation.ok) {
+    throw new Error(`Recovered image deck is invalid:\n${validation.issues.join("\n")}`);
+  }
+  manifest.image_plan = cloneJson(recovery.image_plan);
+  if (recovery.has_mode) manifest.mode = recovery.mode;
+  else delete manifest.mode;
+  if (recovery.has_generation_forbidden) {
+    manifest.generation_forbidden = recovery.generation_forbidden;
+  } else {
+    delete manifest.generation_forbidden;
+  }
+  delete manifest.image_generation_unavailable;
+  delete manifest.image_unavailable_recovery;
+  delete manifest.image_service;
+
+  const deckAfter = serialize(validation.normalized);
+  const manifestAfter = serialize(manifest);
+  const changed = deckAfter !== deckBefore || manifestAfter !== manifestBefore;
+  if (deckAfter !== deckBefore) writeAtomic(deckPath, deckAfter);
+  if (manifestAfter !== manifestBefore) writeAtomic(manifestPath, manifestAfter);
+  console.log(JSON.stringify({
+    ok: true,
+    changed,
+    policy: "retry",
+    restored: true,
+    deck: deckPath,
+    manifest: manifestPath,
+  }));
 }
 
 function deletePropPath(target, propPath) {
@@ -113,6 +161,31 @@ function main() {
   const manifestBefore = fs.readFileSync(manifestPath, "utf8");
   const deck = readJson(deckPath);
   const manifest = readJson(manifestPath);
+  if (opts.policy === "retry") {
+    restoreUnavailablePolicy(
+      deckPath,
+      manifestPath,
+      deckBefore,
+      manifestBefore,
+      manifest
+    );
+    return;
+  }
+  const imagePlan = Array.isArray(manifest.image_plan) ? manifest.image_plan : [];
+  if (opts.policy === "unavailable" && !manifest.image_unavailable_recovery) {
+    manifest.image_unavailable_recovery = {
+      schema_version: 1,
+      deck: cloneJson(deck),
+      image_plan: cloneJson(imagePlan),
+      has_mode: Object.prototype.hasOwnProperty.call(manifest, "mode"),
+      mode: manifest.mode,
+      has_generation_forbidden: Object.prototype.hasOwnProperty.call(
+        manifest,
+        "generation_forbidden"
+      ),
+      generation_forbidden: manifest.generation_forbidden,
+    };
+  }
   const replacedSlides = [];
 
   (deck.slides || []).forEach(slide => {
@@ -123,9 +196,17 @@ function main() {
   }
 
   manifest.mode = "auto";
-  manifest.generation_forbidden = true;
+  manifest.generation_forbidden = opts.policy === "forbidden";
+  if (opts.policy === "unavailable") {
+    manifest.image_generation_unavailable = true;
+  } else {
+    delete manifest.image_generation_unavailable;
+    delete manifest.image_unavailable_recovery;
+  }
   const slidesById = new Map((deck.slides || []).map(slide => [slide.id, slide]));
-  const imagePlan = Array.isArray(manifest.image_plan) ? manifest.image_plan : [];
+  const decisionReason = opts.policy === "unavailable"
+    ? "image generation service unavailable"
+    : "the user explicitly forbids images for this presentation";
   imagePlan.forEach(entry => {
     if (!entry || typeof entry !== "object") return;
     const slide = slidesById.get(entry.slide_id);
@@ -133,7 +214,7 @@ function main() {
     entry.required = false;
     entry.decision = "skip";
     entry.status = "skipped";
-    entry.decision_reason = "the user explicitly forbids images for this presentation";
+    entry.decision_reason = decisionReason;
     entry.prompt = "";
     entry.output_path = null;
     entry.allowed_strategies = ["skip"];
@@ -155,7 +236,7 @@ function main() {
   console.log(JSON.stringify({
     ok: true,
     changed,
-    policy: "forbidden",
+    policy: opts.policy,
     replaced_slides: replacedSlides,
     deck: deckPath,
     manifest: manifestPath,

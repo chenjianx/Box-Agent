@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Mapping, Optional
 
 from box_agent.config import Config, ToolLimitsConfig
+from box_agent.llm.model_routing import resolve_model_client
 from box_agent.tools.base import Tool
 from box_agent.tools.argument_limits import RECOMMENDED_GENERATED_BODY_CHARS
 from box_agent.tools.bash_tool import BashKillTool, BashOutputTool, BashTool
@@ -72,24 +73,23 @@ def _vision_capable_llm(llm: Any | None) -> Any | None:
         )
         if current is not None and "vision" in current.get("tags", ()):
             return llm
-        vision_candidates = sorted(
-            (
-                candidate
-                for candidate in candidates
-                if isinstance(candidate, Mapping)
-                and "vision" in candidate.get("tags", ())
-            ),
-            key=lambda candidate: int(candidate.get("abilityLevel", 0) or 0),
-            reverse=True,
+        vision_candidates = tuple(
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, Mapping)
+            and "vision" in candidate.get("tags", ())
         )
-        for_model = getattr(llm, "for_model", None)
-        if vision_candidates and callable(for_model):
-            selected = vision_candidates[0]
-            return for_model(
-                str(selected["model"]),
-                max_output_tokens=selected.get("maxTokens"),
-            )
-        return None
+        if not vision_candidates:
+            return None
+        resolved, diagnostic = resolve_model_client(
+            llm,
+            task="分析图片内容并执行视觉质量审查",
+            strategy="utility",
+            auto_model_candidates=vision_candidates,
+            task_tags=("vision", "analysis"),
+            required_ability_level=2,
+        )
+        return resolved if diagnostic.get("mode") == "auto" else None
 
     normalized_model = model.lower()
     api_base = str(getattr(llm, "api_base", "") or "").lower()
@@ -681,11 +681,11 @@ def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path, 
             runtime_env=runtime_context.env(),
             use_output_dir=use_output_dir,
             output_dir=str(artifact_root) if artifact_root else None,
+            process_owner_id=process_owner_id,
         )
         tools.append(sandbox_tool)
         # Also add sandbox status tool
-        status_tool = SandboxStatusTool()
-        SandboxStatusTool.set_sandbox_tool(sandbox_tool)
+        status_tool = SandboxStatusTool(sandbox_tool)
         tools.append(status_tool)
         _out(f"{Colors.GREEN}✅ Loaded Jupyter sandbox tool (execute_code){Colors.RESET}")
         _out(f"{Colors.GREEN}✅ Loaded sandbox status tool{Colors.RESET}")

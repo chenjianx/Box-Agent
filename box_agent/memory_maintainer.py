@@ -40,6 +40,8 @@ from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING
 
+from .llm.model_routing import resolve_model_client
+
 from .memory import (
     ContextEntry,
     jaccard as _jaccard,
@@ -403,7 +405,14 @@ class MemoryMaintainer_Compact:  # placeholder so the file parses; will be inlin
         )
 
         try:
-            response = await self._llm.generate(
+            maintenance_llm, _ = resolve_model_client(
+                self._llm,
+                task="总结压缩长期记忆",
+                strategy="utility",
+                task_tags=("summary",),
+                required_ability_level=1,
+            )
+            response = await maintenance_llm.generate(
                 messages=[
                     Msg(role="system", content=_COMPACT_SYSTEM_PROMPT),
                     Msg(role="user", content=user_prompt),
@@ -651,7 +660,14 @@ class MemoryMaintainer_Conflict:  # placeholder — bound onto MemoryMaintainer 
             )
 
             try:
-                response = await self._llm.generate(
+                maintenance_llm, _ = resolve_model_client(
+                    self._llm,
+                    task="分析仲裁冲突记忆",
+                    strategy="utility",
+                    task_tags=("analysis", "reasoning"),
+                    required_ability_level=2,
+                )
+                response = await maintenance_llm.generate(
                     messages=[
                         Msg(role="system", content=_CONFLICT_SYSTEM_PROMPT),
                         Msg(role="user", content=user_prompt),

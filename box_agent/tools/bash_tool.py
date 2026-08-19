@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import platform
 import re
@@ -93,6 +94,25 @@ def _truncate_bash_streams(
         return stdout, stderr, 0
     truncated, dropped = _truncate_bash_output(combined, "combined stdout/stderr", limit)
     return truncated, "", dropped
+
+
+def _format_bash_result_content(
+    stdout: str,
+    stderr: str,
+    *,
+    bash_id: str | None = None,
+    exit_code: int = 0,
+) -> str:
+    """Format Bash streams once for host display or shared persistence."""
+
+    output = stdout
+    if stderr:
+        output += f"\n[stderr]:\n{stderr}"
+    if bash_id:
+        output += f"\n[bash_id]:\n{bash_id}"
+    if exit_code:
+        output += f"\n[exit_code]:\n{exit_code}"
+    return output or "(no output)"
 
 
 # Shells whose syntax is POSIX-compatible (supports &&, ||, for/do/done, etc.)
@@ -508,20 +528,12 @@ class BashOutputResult(ToolResult):
     @model_validator(mode="after")
     def format_content(self) -> "BashOutputResult":
         """Auto-format content from stdout and stderr if content is empty."""
-        output = ""
-        if self.stdout:
-            output += self.stdout
-        if self.stderr:
-            output += f"\n[stderr]:\n{self.stderr}"
-        if self.bash_id:
-            output += f"\n[bash_id]:\n{self.bash_id}"
-        if self.exit_code:
-            output += f"\n[exit_code]:\n{self.exit_code}"
-
-        if not output:
-            output = "(no output)"
-
-        self.content = output
+        self.content = _format_bash_result_content(
+            self.stdout,
+            self.stderr,
+            bash_id=self.bash_id,
+            exit_code=self.exit_code,
+        )
         return self
 
 
@@ -756,6 +768,8 @@ class BashTool(Tool):
     - Windows: PowerShell
     - Unix/Linux/macOS: bash
     """
+
+    max_result_size_chars = math.inf
 
     def __init__(
         self,
@@ -1291,7 +1305,8 @@ Examples:
                     exit_code=1,
                 )
 
-            # 1. Dangerous command detection (always active)
+            # 1. Dangerous command approval remains independent from filesystem
+            # scope. Full access must not silently authorize destructive actions.
             danger_reason = detect_dangerous_command(command)
             if danger_reason:
                 if not self._consume_safety_approval(command, danger_reason):
@@ -1454,6 +1469,11 @@ Examples:
 
                 original_stdout_chars = len(stdout_text)
                 original_stderr_chars = len(stderr_text)
+                complete_content = _format_bash_result_content(
+                    stdout_text,
+                    stderr_text,
+                    exit_code=process.returncode or 0,
+                )
                 stdout_text, stderr_text, dropped = _truncate_bash_streams(
                     stdout_text, stderr_text
                 )
@@ -1495,6 +1515,7 @@ Examples:
                     stderr=stderr_text,
                     exit_code=process.returncode or 0,
                     raw_output=raw_output,
+                    persistence_content=complete_content if dropped else None,
                 )
 
         except Exception as e:
@@ -1509,6 +1530,8 @@ Examples:
 
 class BashOutputTool(Tool):
     """Retrieve output from background bash shells."""
+
+    max_result_size_chars = math.inf
 
     def __init__(self, process_owner_id: str | None = None):
         self.process_owner_id = process_owner_id
@@ -1587,6 +1610,13 @@ class BashOutputTool(Tool):
             # Get new output
             new_lines = bg_shell.get_new_output(filter_pattern=filter_str)
             stdout = "\n".join(new_lines) if new_lines else ""
+            exit_code = bg_shell.exit_code if bg_shell.exit_code is not None else 0
+            complete_content = _format_bash_result_content(
+                stdout,
+                "",
+                bash_id=bash_id,
+                exit_code=exit_code,
+            )
 
             # Truncate large batches for the same reason foreground execution
             # does — `bash_output` can pull a very large accumulated stream
@@ -1610,9 +1640,10 @@ class BashOutputTool(Tool):
                 success=True,
                 stdout=stdout,
                 stderr="",  # Background shells combine stdout/stderr
-                exit_code=bg_shell.exit_code if bg_shell.exit_code is not None else 0,
+                exit_code=exit_code,
                 bash_id=bash_id,
                 raw_output=raw_output,
+                persistence_content=complete_content if dropped else None,
             )
 
         except Exception as e:

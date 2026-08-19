@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import math
 import tempfile
 from pathlib import Path
 
@@ -34,6 +35,16 @@ def test_file_tool_package_preserves_legacy_imports():
     assert PackagedJsonlQueryTool is LegacyJsonlQueryTool
 
 
+def test_bounded_read_tools_opt_out_of_shared_result_compression(tmp_path):
+    tools = (
+        ReadTool(workspace_dir=str(tmp_path)),
+        JsonlQueryTool(workspace_dir=str(tmp_path)),
+        SearchFilesTool(workspace_dir=str(tmp_path)),
+    )
+
+    assert all(math.isinf(tool.max_result_size_chars) for tool in tools)
+
+
 @pytest.mark.asyncio
 async def test_read_tool():
     """Test read file tool."""
@@ -49,6 +60,7 @@ async def test_read_tool():
         result = await tool.execute(path=temp_path)
 
         assert result.success, f"Read failed: {result.error}"
+        assert result.model_context is None
         # ReadTool now returns content with line numbers in format: "LINE_NUMBER|LINE_CONTENT"
         assert "Hello, World!" in result.content, f"Content mismatch: {result.content}"
         assert "|Hello, World!" in result.content, f"Expected line number format: {result.content}"
@@ -73,6 +85,22 @@ async def test_read_tool():
         print("✅ ReadTool test passed")
     finally:
         Path(temp_path).unlink()
+
+
+@pytest.mark.asyncio
+async def test_read_tool_keeps_large_generated_page_as_model_content(tmp_path):
+    page = tmp_path / "generated.html"
+    marker = "EXACT_GENERATED_PAGE_CONTENT"
+    page.write_text("<html>\n" + ("<p>detail</p>\n" * 700) + marker, encoding="utf-8")
+
+    result = await ReadTool(workspace_dir=str(tmp_path)).execute(
+        path=page.name,
+        limit=1_000,
+    )
+
+    assert result.success
+    assert marker in result.content
+    assert result.model_context is None
 
 
 @pytest.mark.asyncio
@@ -738,6 +766,20 @@ async def test_write_tool():
         assert file_path.exists(), "File was not created"
         assert file_path.read_text() == "Test content", "Content mismatch"
         print("✅ WriteTool test passed")
+
+
+def test_write_tool_schema_names_active_relative_root(tmp_path):
+    artifact_root = tmp_path / "output"
+    tool = WriteTool(
+        workspace_dir=str(tmp_path),
+        relative_root_dir=str(artifact_root),
+    )
+
+    description = tool.parameters["properties"]["path"]["description"]
+
+    assert "Prefer a path relative to the active project/artifact root" in description
+    assert str(artifact_root) in description
+    assert "Absolute paths are used exactly as supplied" in description
 
 
 @pytest.mark.asyncio

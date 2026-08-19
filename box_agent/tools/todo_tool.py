@@ -751,6 +751,11 @@ class TodoReadTool(Tool):
             },
         }
 
+    def compaction_state(self) -> tuple[str, str]:
+        items = self._store.list()
+        content = self._format_items(items) if items else "No todo items."
+        return "Todo", content
+
     async def execute(self, todo_id: str | None = None, status: str | None = None) -> ToolResult:
         all_items = self._store.list()
         snapshot = _todo_snapshot(all_items)

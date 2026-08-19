@@ -288,6 +288,7 @@ function isStructuralEvidenceExemptSlide(slide, index) {
 
 const ASSUMPTION_EVIDENCE_RE = /假设|示意|假定|assum(?:e|ed|ption)|illustrative|hypothetical/i;
 const UNAVAILABLE_FACT_PLACEHOLDER_RE = /未提供|未给出|待补充|待确认|缺失|未知|暂无可验证公开数据|not\s+provided|not\s+supplied|missing|unknown|tbd|no\s+verifiable\s+public\s+data/i;
+const FRAMEWORK_UNAVAILABLE_FACT_PLACEHOLDER = "暂无可验证公开数据";
 const PRIVATE_IDENTITY_FACT_RE = /(?:融资(?:阶段|轮次)|(?:种子|天使|成长)轮|pre[-\s]?a|series\s+[a-z]|[a-f]\s*轮|(?:公司|项目|产品)(?:名称|名为)|成立(?:年份|时间)|创始人|团队(?:成员姓名|姓名|履历|规模|人数|来源)|客户(?:名称|名单)|奖项|获奖|排名)/i;
 
 function validate(outline, opts) {
@@ -429,18 +430,39 @@ function validate(outline, opts) {
     }
 
     const structuralEvidenceExempt = isStructuralEvidenceExemptSlide(slide, index);
+    const frameworkDelivery = verifiedResearch
+      && verifiedResearch.deliveryMode === "framework";
 
     if (!Array.isArray(slide.evidence)) {
       issues.push(`${label}: evidence must be an array, use [] for non-evidence slides`);
     } else {
-      if (publicResearch && slide.evidence.length === 0) {
+      if ((publicResearch || frameworkDelivery) && slide.evidence.length === 0) {
+        const exactFrameworkGap = [
+          slide.message,
+          ...(Array.isArray(slide.bullets) ? slide.bullets : []),
+        ].some(value => text(value).includes(FRAMEWORK_UNAVAILABLE_FACT_PLACEHOLDER));
         const slideNarrative = [
           slide.title,
           slide.message,
           ...(Array.isArray(slide.bullets) ? slide.bullets : []),
           slide.notes,
         ].map(text).join(" ");
-        if (UNAVAILABLE_FACT_PLACEHOLDER_RE.test(slideNarrative)) {
+        if (frameworkDelivery && structuralEvidenceExempt) {
+          warnings.push(
+            `${label}: structural public-research page has no factual evidence; ` +
+            "cover, agenda, and section-divider pages may keep evidence empty"
+          );
+        } else if (frameworkDelivery && exactFrameworkGap) {
+          warnings.push(
+            `${label}: framework research page has no evidence because message or ` +
+            "bullets contain the exact unavailable-data placeholder"
+          );
+        } else if (frameworkDelivery) {
+          issues.push(
+            `${label}: framework research page without evidence must put the exact ` +
+            `${FRAMEWORK_UNAVAILABLE_FACT_PLACEHOLDER} placeholder in message or bullets`
+          );
+        } else if (UNAVAILABLE_FACT_PLACEHOLDER_RE.test(slideNarrative)) {
           warnings.push(
             `${label}: public-research page has no evidence because it explicitly ` +
             "marks a required fact as unavailable"

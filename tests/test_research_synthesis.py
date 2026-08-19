@@ -166,6 +166,62 @@ def test_validator_writes_failed_report_when_research_is_too_shallow(
     assert "expected at least 3 dimension files, found 2" in payload["issues"]
 
 
+def test_validator_reports_hyphenated_reserved_suffixes_as_near_matches(
+    tmp_path: Path,
+) -> None:
+    research = tmp_path / "research"
+    research.mkdir()
+    for name in (
+        "topic-dim01.md",
+        "topic-wide01.md",
+        "topic-cross_verification.md",
+        "topic-insight.md",
+    ):
+        (research / name).write_text(f"# {name}\n", encoding="utf-8")
+    (research / "topic-evidence.json").write_text("{}\n", encoding="utf-8")
+    report = research / "qa" / "topic_research_check.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(VALIDATOR),
+            "--research-dir",
+            str(research),
+            "--topic",
+            "topic",
+            "--route",
+            "A",
+            "--min-dimensions",
+            "1",
+            "--report",
+            str(report),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    issues = json.loads(report.read_text(encoding="utf-8"))["issues"]
+    joined = "\n".join(issues)
+    assert (
+        "topic_cross_verification.md; found non-canonical near-match "
+        "topic-cross_verification.md"
+    ) in joined
+    assert (
+        "topic_insight.md; found non-canonical near-match topic-insight.md"
+        in joined
+    )
+    assert "non-canonical dimension filenames ignored: topic-dim01.md" in joined
+    assert "Use the exact pattern topic_dimNN.md" in joined
+    assert "non-canonical near-match(es): topic-wide01.md" in joined
+    assert "Use the exact pattern topic_wideNN.md" in joined
+    assert (
+        "topic_evidence.json; found non-canonical near-match topic-evidence.json"
+        in joined
+    )
+
+
 def test_validator_rejects_cross_entity_excerpt_mismatch(tmp_path: Path) -> None:
     research = tmp_path / "research"
     _write_focused_research(
@@ -510,5 +566,12 @@ def test_research_instructions_use_artifact_relative_validator_paths() -> None:
 
     assert '--research-dir "research"' in skill
     assert '--report "research/qa/{topic}_research_check.json"' in skill
+    assert "artifact-root-relative `research/...`" in skill
+    assert "Reserved research artifact templates override" in skill
+    assert "ai-quality-scheduling_dim01.md" in skill
+    assert "never write\n  `ai-quality-scheduling-dim01.md`" in skill
+    assert "displayed session" in skill
+    assert "workspace is the filesystem safety boundary" in skill
+    assert "Never derive an absolute research path from it" in skill
     assert "do not use `$(pwd)/output/research`" in skill
     assert '--research-dir "{workspace}/research"' not in skill

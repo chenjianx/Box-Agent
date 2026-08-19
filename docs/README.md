@@ -14,6 +14,9 @@ contracts.
 | Understand Anything code map | [Code Map Guide](UNDERSTAND_ANYTHING.md) | [代码图谱指南](UNDERSTAND_ANYTHING_CN.md) |
 | Production and runtime packaging | [Production Guide](PRODUCTION_GUIDE.md) | [生产指南](PRODUCTION_GUIDE_CN.md) |
 | Maintainer review | [Review Guide](REVIEW_GUIDE.md) | [维护者 Review 指南](REVIEW_GUIDE_CN.md) |
+| Pull request review standard | [PR Review Standard](PR_REVIEW_STANDARD.md) | [PR 审查规范](PR_REVIEW_STANDARD_CN.md) |
+| Review design context | [Design index](design/README.md) | Same document |
+| Review change history | [Change index](changes/README.md) | Same document |
 | Current published/unreleased state | [Release State](RELEASE_STATE.md) | Same document |
 | Third-party model API behavior | [Third-party API Compatibility](THIRD_PARTY_API_COMPATIBILITY.md) | Same document |
 

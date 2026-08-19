@@ -116,7 +116,7 @@ from box_agent.events import (
 )
 from box_agent.client_info import ClientInfo, scoped_client_info
 from box_agent.llm import LLMClient, SessionBoundLLM
-from box_agent.llm.model_routing import normalize_auto_routing
+from box_agent.llm.model_routing import normalize_auto_routing, resolve_model_client
 from box_agent.llm.token_meter import get_token_meter, reset_token_meter, start_token_meter
 from box_agent.session_trace import SessionTraceWriter, scoped_session_trace
 from box_agent.completion import (
@@ -786,6 +786,7 @@ class SessionState:
     agent: Agent
     trace_writer: SessionTraceWriter | None = None
     session_llm: SessionBoundLLM | None = None
+    summary_llm: SessionBoundLLM | None = None
     cancelled: bool = False
     output_dir: str | None = None  # ``{workspace}/output/`` — the canonical artifact root
     artifact_mode: str = "output"
@@ -829,6 +830,7 @@ class SessionState:
 
 
 _MAX_SOURCE_TEXT_ENV_CHARS = 120_000
+_CONTEXT_SUMMARY_MAX_OUTPUT_TOKENS = 4_096
 
 def _bind_user_source_text(state: SessionState, user_request: str) -> None:
     """Expose accumulated real user text to local provenance-aware tools.
@@ -908,6 +910,70 @@ class BoxACPAgent:
             binding["model"],
             max_output_tokens=binding.get("maxTokens"),
         )
+
+    def _summary_llm_for_session(
+        self,
+        *,
+        session_llm: SessionBoundLLM,
+        session_id: str,
+        title: str,
+        client_info: ClientInfo | None,
+    ) -> SessionBoundLLM:
+        """Return a session-routed, output-bounded client for compaction."""
+
+        summary_client, diagnostic = resolve_model_client(
+            session_llm,
+            task="总结压缩会话上下文，保留关键事实与执行状态",
+            strategy="utility",
+            max_output_tokens_cap=_CONTEXT_SUMMARY_MAX_OUTPUT_TOKENS,
+            task_tags=("summary",),
+            required_ability_level=1,
+        )
+        bound = (
+            summary_client
+            if isinstance(summary_client, SessionBoundLLM)
+            else SessionBoundLLM(summary_client)
+        )
+        bound.set_request_context(
+            session_id=session_id,
+            title=title,
+            call_kind="context_summary",
+            client_info=client_info,
+        )
+        log.info(
+            "context_summary/model_routing",
+            session_id=session_id,
+            model=str(getattr(bound, "model", "") or ""),
+            routing=diagnostic,
+        )
+        return bound
+
+    def _utility_llm_for_meta(self, meta: dict[str, Any]) -> SessionBoundLLM:
+        """Resolve the session/manual binding carried by a utility request."""
+
+        binding = _normalize_llm_binding(meta)
+        raw_session_id = meta.get("session_id")
+        upstream_session_id = (
+            raw_session_id.strip() if isinstance(raw_session_id, str) else ""
+        )
+        if binding is None and upstream_session_id:
+            state = next(
+                (
+                    candidate
+                    for candidate in getattr(self, "_sessions", {}).values()
+                    if candidate.upstream_session_id == upstream_session_id
+                    and candidate.session_llm is not None
+                ),
+                None,
+            )
+            if state is not None and state.session_llm is not None:
+                return state.session_llm
+
+        bound = SessionBoundLLM(self._llm_for_binding(binding))
+        bound.set_auto_model_candidates(
+            (binding or {}).get("autoRouting", {}).get("models", [])
+        )
+        return bound
 
     def _set_agent_system_prompt(self, agent: Agent, system_prompt: str) -> None:
         """Update all live holders of the current system prompt."""
@@ -1117,6 +1183,57 @@ class BoxACPAgent:
         if injected:
             log.info("mcp/catalog_ready_injected", sessions=injected)
 
+    async def _refresh_mcp_after_auth_change(self) -> list[dict]:
+        """Reconnect auth-failed MCP servers after the host refreshes auth.json."""
+
+        if not self._mcp_loaded:
+            return []
+        from box_agent.tools.mcp_loader import (
+            get_all_mcp_tools,
+            get_mcp_tools_for_server,
+            reconnect_auth_failed_mcp_servers_if_token_changed,
+        )
+
+        results = await reconnect_auth_failed_mcp_servers_if_token_changed()
+        if not results:
+            return []
+
+        if not self._config.tools.mcp.deferred_loading_enabled:
+            all_mcp_tools = get_all_mcp_tools()
+            sync_mcp_tool_list(
+                self._base_tools,
+                all_mcp_tools,
+                self._base_mcp_fallback_tools,
+            )
+            for state in self._sessions.values():
+                sync_mcp_tools(
+                    state.agent.tools,
+                    all_mcp_tools,
+                    state.mcp_fallback_tools,
+                )
+
+        for result in results:
+            name = str(result.get("name") or "")
+            success = bool(result.get("success"))
+            tools = get_mcp_tools_for_server(name) if success else []
+            injected = self._inject_mcp_runtime_update(
+                name=name,
+                state="connected" if success else "failed",
+                tool_count=len(tools),
+                always_load_count=sum(
+                    bool(getattr(tool, "mcp_always_load", False))
+                    for tool in tools
+                ),
+            )
+            log.info(
+                "mcp/auth_refresh_reconnect",
+                server=name,
+                success=success,
+                error=result.get("error"),
+                context_injected_sessions=injected,
+            )
+        return results
+
     async def _ensure_skills_loaded(self) -> None:
         """Await the background skill-discovery task before it's needed.
 
@@ -1261,6 +1378,12 @@ class BoxACPAgent:
             title=upstream_title,
             client_info=client_info,
         )
+        summary_llm = self._summary_llm_for_session(
+            session_llm=session_llm,
+            session_id=upstream_session_id or session_id,
+            title=upstream_title,
+            client_info=client_info,
+        )
 
         # Canonical artifact directory is only part of output mode. Existing
         # project workspaces are edited in place and must not get an implicit
@@ -1292,9 +1415,61 @@ class BoxACPAgent:
         perm_engine = None
         grant_store = GrantStore()
         effective_policy: CapabilityPolicy | None = None
-        if self._has_officev3_policy():
+        raw_permission_mode = meta.get("permission_mode") if isinstance(meta, dict) else None
+        permission_mode = (
+            raw_permission_mode
+            if isinstance(raw_permission_mode, str)
+            and raw_permission_mode in {"default", "full_access"}
+            else None
+        )
+        if raw_permission_mode is not None and permission_mode is None:
+            log.warn(
+                "session/permissions",
+                session_id=session_id,
+                message=f"Invalid permission_mode={raw_permission_mode!r}; using default permissions",
+            )
+            permission_mode = "default"
+        if (
+            permission_mode == "full_access"
+            and not self._config.tools.allow_full_access
+        ):
+            log.warn(
+                "session/permissions",
+                session_id=session_id,
+                message=(
+                    "Session requested full_access but the server disables "
+                    "tools.allow_full_access; using default permissions"
+                ),
+            )
+            permission_mode = "default"
+        session_allow_full_access = (
+            self._config.tools.allow_full_access
+            and permission_mode != "default"
+        )
+        # execute_code is a real Python process, not an OS filesystem sandbox.
+        # Expose it only when the server has explicitly enabled full access.
+        session_sandbox_mode = session_allow_full_access
+
+        if (
+            permission_mode != "full_access"
+            and (self._has_officev3_policy() or permission_mode == "default")
+        ):
             try:
-                base_policy = CapabilityPolicy.from_config(self._config)
+                base_policy = (
+                    CapabilityPolicy.from_config(self._config)
+                    if self._has_officev3_policy()
+                    else CapabilityPolicy()
+                )
+                if permission_mode == "default":
+                    # Explicit session-default mode must fail closed even when
+                    # the host omits its filesystem context. Host-provided
+                    # values below may narrow or extend this session baseline.
+                    base_policy = base_policy.with_filesystem_overrides(
+                        session_workspace_root=str(workspace),
+                        allowed_directories=[],
+                        filesystem_scope="session_workspace",
+                        replace_allowed_directories=True,
+                    )
 
                 # officev3_permissions_override is DEPRECATED — kept for parsing only.
                 # In-band permission/request negotiation handles escalation now.
@@ -1330,6 +1505,7 @@ class BoxACPAgent:
                         session_workspace_root=swr,
                         allowed_directories=extra_dirs,
                         filesystem_scope=fs_scope,
+                        replace_allowed_directories=permission_mode == "default",
                     )
                     log.info(
                         "session/permissions",
@@ -1356,9 +1532,15 @@ class BoxACPAgent:
                 )
                 effective_policy = fallback_policy
                 perm_engine = PermissionEngine(fallback_policy, workspace, grant_store=grant_store)
+        elif permission_mode == "full_access":
+            log.warn(
+                "session/permissions",
+                session_id=session_id,
+                message="Full access enabled for this session; permission checks are bypassed",
+            )
 
         skill_runtime_context = build_skill_runtime_context(
-            sandbox_mode=True,
+            sandbox_mode=session_sandbox_mode,
             env_context=env_context,
         )
         session_skill_loader = self._skill_loader
@@ -1421,8 +1603,8 @@ class BoxACPAgent:
                 tools,
                 self._config,
                 workspace,
-                sandbox_mode=True,
-                allow_full_access=self._config.tools.allow_full_access,
+                sandbox_mode=session_sandbox_mode,
+                allow_full_access=session_allow_full_access,
                 non_interactive=True,  # ACP cannot do interactive terminal prompts
                 output=lambda msg: sys.stderr.write(msg + "\n"),
                 llm=session_llm,
@@ -1501,6 +1683,7 @@ class BoxACPAgent:
         )
         self._sessions[session_id] = SessionState(
             agent=agent, session_llm=session_llm,
+            summary_llm=summary_llm,
             trace_writer=trace_writer,
             output_dir=output_dir, session_mode=session_mode,
             llm_binding=llm_binding,
@@ -1814,6 +1997,20 @@ class BoxACPAgent:
                 turn_id=turn_id,
                 title=state.upstream_title,
             )
+        if state.session_llm is not None:
+            state.summary_llm = self._summary_llm_for_session(
+                session_llm=state.session_llm,
+                session_id=billing_session_id,
+                title=state.upstream_title,
+                client_info=self._client_info,
+            )
+        if state.summary_llm is not None:
+            state.summary_llm.set_request_context(
+                session_id=billing_session_id,
+                turn_id=turn_id,
+                title=state.upstream_title,
+                call_kind="context_summary",
+            )
         if state.memory_extractor is not None and hasattr(state.memory_extractor, "set_turn_id"):
             state.memory_extractor.set_turn_id(turn_id)
         plan_approval = _plan_approval_from_meta(prompt_meta)
@@ -1891,6 +2088,7 @@ class BoxACPAgent:
 
         # Ensure background-loaded MCP tools are available before running the turn
         await self._ensure_mcp_loaded()
+        await self._refresh_mcp_after_auth_change()
 
         # Skills should already be ready (newSession awaited them), but
         # short-circuit any edge case where a session was created before
@@ -2940,7 +3138,8 @@ class BoxACPAgent:
         prompt = params.get("prompt", "")
         system_prompt = params.get("systemPrompt") or None
         timeout_ms = params.get("timeoutMs")
-        meta = params.get("_meta") or {}
+        raw_meta = params.get("_meta")
+        meta = raw_meta if isinstance(raw_meta, dict) else {}
         client_info = (
             ClientInfo.from_meta(meta.get("client_info"))
             if isinstance(meta, dict)
@@ -2982,12 +3181,58 @@ class BoxACPAgent:
             except (TypeError, ValueError):
                 return {"error": {"code": "invalid_args", "message": "timeoutMs must be a number"}}
 
-        provider = getattr(self._lite_llm, "provider", None)
-        model = getattr(self._lite_llm, "model", "")
+        if "title" in normalized_purpose:
+            routing_tags = ("summary", "rewrite", "fast")
+            routing_ability = 1
+        elif "presentation" in normalized_purpose:
+            routing_tags = ("presentation", "analysis")
+            routing_ability = 1
+        elif "summary" in normalized_purpose:
+            routing_tags = ("summary", "fast")
+            routing_ability = 1
+        elif "expert" in normalized_purpose:
+            routing_tags = ("analysis", "reasoning")
+            routing_ability = 2
+        else:
+            routing_tags = None
+            routing_ability = None
+
+        utility_llm = self._utility_llm_for_meta(meta)
+        utility_llm, routing_diagnostic = resolve_model_client(
+            utility_llm,
+            task=" ".join(
+                part
+                for part in (
+                    str(purpose).strip(),
+                    str(workspace_label).strip(),
+                    prompt[:2_000],
+                )
+                if part
+            ),
+            strategy="utility",
+            task_tags=routing_tags,
+            required_ability_level=routing_ability,
+        )
+        utility_llm.set_request_context(
+            session_id=session_id,
+            turn_id=turn_id,
+            title=title,
+            call_kind=call_kind,
+            client_info=client_info,
+        )
+        provider = getattr(utility_llm, "provider", None)
+        model = getattr(utility_llm, "model", "")
+        log.info(
+            "llm/prompt_model_routing",
+            purpose=purpose,
+            workspace=workspace_label,
+            model=model,
+            routing=routing_diagnostic,
+        )
         try:
             with scoped_client_info(client_info):
                 result = await run_lightweight_prompt(
-                    self._lite_llm,
+                    utility_llm,
                     prompt,
                     system_prompt=system_prompt,
                     session_id=session_id,
@@ -3593,9 +3838,16 @@ class BoxACPAgent:
             if not latest_user_request or not final_content.strip():
                 return []
 
+            suggestion_llm, routing_diagnostic = resolve_model_client(
+                state.session_llm or state.agent.llm,
+                task="根据本轮回答生成简短的下一步建议",
+                strategy="utility",
+                task_tags=("general", "chat", "fast"),
+                required_ability_level=1,
+            )
             try:
                 result = await run_lightweight_prompt(
-                    self._lite_llm,
+                    suggestion_llm,
                     build_follow_up_suggestions_generation_prompt(
                         latest_user_request,
                         final_content,
@@ -3621,6 +3873,8 @@ class BoxACPAgent:
                 session_id=session_id,
                 count=len(suggestions),
                 duration_ms=result.duration_ms,
+                model=str(getattr(suggestion_llm, "model", "") or ""),
+                routing=routing_diagnostic,
             )
             return suggestions
 
@@ -3695,6 +3949,7 @@ class BoxACPAgent:
         run_options = replace(
             agent.default_run_options(),
             llm=llm,
+            summary_llm=state.summary_llm,
             is_cancelled=lambda: state.cancelled,
             logger=None,  # ACP uses its own logging via the connection
             permission_negotiator=negotiator,
@@ -4658,34 +4913,9 @@ async def run_acp_server(config: Config | None = None) -> None:
             timeout=config.llm.timeout,
         )
 
-        # Lite LLM client for tool-free small tasks (titles / summaries).
-        # When `lite_llm:` is absent from config, fall back to the main client
-        # so call sites stay uniform.
-        if config.lite_llm._present:
-            lite_rcfg = config.lite_llm.retry
-            lite_provider = (
-                LLMProvider.ANTHROPIC
-                if config.lite_llm.provider.lower() == "anthropic"
-                else LLMProvider.OPENAI
-            )
-            lite_llm = LLMClient(
-                api_key=config.lite_llm.api_key,
-                provider=lite_provider,
-                api_base=config.lite_llm.api_base,
-                model=config.lite_llm.model,
-                retry_config=RetryConfigBase(
-                    enabled=lite_rcfg.enabled,
-                    max_retries=lite_rcfg.max_retries,
-                    initial_delay=lite_rcfg.initial_delay,
-                    max_delay=lite_rcfg.max_delay,
-                    exponential_base=lite_rcfg.exponential_base,
-                ),
-                max_output_tokens=config.lite_llm.max_output_tokens,
-                auth_file=config.lite_llm.auth_file,
-                timeout=config.lite_llm.timeout,
-            )
-        else:
-            lite_llm = llm
+        # Kept as a constructor compatibility alias only. Internal calls now
+        # resolve from the session binding and its host-provided auto pool.
+        lite_llm = llm
 
         # Create memory manager if enabled
         memory_mgr = None
@@ -4776,13 +5006,10 @@ async def run_acp_server(config: Config | None = None) -> None:
             system_prompt = system_prompt.replace("{SKILLS_METADATA}", "")
 
         log.info("server/start", message=f"LLM: {config.llm.model}, provider: {config.llm.provider}")
-        if config.lite_llm._present:
-            log.info(
-                "server/start",
-                message=f"Lite LLM: {config.lite_llm.model or '<server-default>'}, provider: {config.lite_llm.provider}, base: {config.lite_llm.api_base}",
-            )
-        else:
-            log.info("server/start", message="Lite LLM: <fallback to main>")
+        log.info(
+            "server/start",
+            message="Internal LLM routing: session binding / host auto model pool",
+        )
         log.info("server/start", message=f"Tools loaded: {len(base_tools)} base tools")
 
         # Restore real stdout for ACP transport, then re-guard sys.stdout

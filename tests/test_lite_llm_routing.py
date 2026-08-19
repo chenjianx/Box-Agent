@@ -15,6 +15,7 @@ from box_agent.config import (
     ToolsConfig,
 )
 from box_agent.llm import LLMClient
+from box_agent.llm.model_routing import resolve_model_client
 from box_agent.schema import LLMProvider, LLMResponse, StreamEvent
 
 
@@ -100,6 +101,40 @@ def test_lite_llm_distinct_when_provided(tmp_path):
     assert agent2._llm is main
     assert agent2._lite_llm is other
     assert agent2._lite_llm is not main
+
+
+def test_internal_model_resolver_uses_tags_only_with_auto_pool():
+    manual = _DummyLLM("manual")
+    locked, locked_diagnostic = resolve_model_client(
+        manual,
+        task="提炼会话标题",
+    )
+    assert locked is manual
+    assert locked_diagnostic == {"mode": "inherit", "reason": "no_auto_model_pool"}
+
+    automatic = _DummyLLM("automatic")
+    automatic.auto_model_candidates = (
+        {
+            "model": "reasoning-model",
+            "tags": ["analysis", "reasoning"],
+            "abilityLevel": 3,
+        },
+        {
+            "model": "summary-fast-model",
+            "tags": ["summary", "fast"],
+            "abilityLevel": 1,
+            "maxTokens": 8_000,
+        },
+    )
+    routed, diagnostic = resolve_model_client(
+        automatic,
+        task="提炼会话标题",
+        max_output_tokens_cap=4_096,
+    )
+    assert routed.model == "summary-fast-model"
+    assert routed.max_output_tokens == 4_096
+    assert diagnostic["mode"] == "auto"
+    assert diagnostic["selected_model"] == "summary-fast-model"
 
 
 def test_llm_client_for_model_preserves_endpoint_auth_and_default(tmp_path):
@@ -331,25 +366,72 @@ async def test_session_switches_model_between_turns_without_recreating_agent(tmp
 
 
 @pytest.mark.asyncio
-async def test_llm_prompt_routes_to_lite_client(tmp_path):
+async def test_llm_prompt_without_session_binding_inherits_main_client(tmp_path):
     agent, main, lite = _make_agent(tmp_path, lite=True)
     result = await agent._llm_prompt({"prompt": "title this"})
     assert "error" not in result
-    assert result["text"] == "reply-from-lite"
-    assert lite.last_messages is not None
-    assert main.last_messages is None  # main untouched
+    assert result["text"] == "reply-from-main"
+    assert main.last_messages is not None
+    assert lite.last_messages is None
 
 
 @pytest.mark.asyncio
-async def test_llm_prompt_threads_meta_session_id_to_lite_client(tmp_path):
-    agent, _main, lite = _make_agent(tmp_path, lite=True)
+async def test_llm_prompt_threads_meta_session_id_to_main_client_without_binding(tmp_path):
+    agent, main, lite = _make_agent(tmp_path, lite=True)
     result = await agent._llm_prompt({
         "prompt": "title this",
         "_meta": {"session_id": "office-session-1"},
     })
 
     assert "error" not in result
-    assert lite.last_kwargs["session_id"] == "office-session-1"
+    assert main.last_kwargs["session_id"] == "office-session-1"
+    assert lite.last_kwargs is None
+
+
+@pytest.mark.asyncio
+async def test_llm_prompt_routes_auto_by_tags_and_locks_explicit_binding(tmp_path):
+    agent, _main, _lite = _make_agent(tmp_path, lite=True)
+    automatic = await agent._llm_prompt(
+        {
+            "prompt": "请为复杂的 PPT 数据分析、研究和代码任务提炼一个会话标题",
+            "_meta": {
+                "purpose": "title",
+                "llm_binding": {
+                    "source": "builtin",
+                    "model": "analysis-model",
+                    "autoRouting": {
+                        "models": [
+                            {
+                                "model": "analysis-model",
+                                "tags": ["analysis", "reasoning"],
+                                "abilityLevel": 3,
+                            },
+                            {
+                                "model": "summary-fast-model",
+                                "tags": ["summary", "fast"],
+                                "abilityLevel": 1,
+                            },
+                        ]
+                    },
+                },
+            },
+        }
+    )
+    assert automatic["text"] == "reply-from-bound-summary-fast-model"
+
+    manual = await agent._llm_prompt(
+        {
+            "prompt": "请提炼一个会话标题",
+            "_meta": {
+                "purpose": "title",
+                "llm_binding": {
+                    "source": "builtin",
+                    "model": "explicit-model",
+                },
+            },
+        }
+    )
+    assert manual["text"] == "reply-from-bound-explicit-model"
 
 
 def test_config_lite_llm_absent_marks_not_present():

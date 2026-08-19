@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 # cutting JSON mid-string and triggering empty-arguments retry loops). Pin a
 # generous default; users can override via ``LLMConfig.max_output_tokens``.
 _DEFAULT_MAX_TOKENS = 64000
+_DEEP_THINK_REASONING_EFFORT = "high"
 _SENSENOVA_MODEL_PREFIXES = ("sensenova-", "sn-sensenova-")
 _SENSENOVA_PSEUDO_TOOL_CALL_RE = re.compile(
     r"<tool_call>\s*<function=([A-Za-z_][\w.-]*)>\s*(.*?)\s*</function>\s*</tool_call>",
@@ -60,6 +61,21 @@ def _sensenova_thinking_body() -> dict[str, Any]:
             "reasoning_effort": "high",
         }
     }
+
+
+def _apply_thinking_params(
+    params: dict[str, Any],
+    *,
+    model: str | None,
+    thinking_enabled: bool,
+) -> None:
+    """Map the session deep-think flag to the provider request dialect."""
+    if not thinking_enabled:
+        return
+    if _is_sensenova_model(model):
+        params["extra_body"] = _sensenova_thinking_body()
+        return
+    params["reasoning_effort"] = _DEEP_THINK_REASONING_EFFORT
 
 
 def _tool_parameter_types(
@@ -408,8 +424,11 @@ class OpenAIClient(LLMClientBase):
         if tools:
             params["tools"] = self._convert_tools(tools)
 
-        if thinking_enabled and _is_sensenova_model(self.model):
-            params["extra_body"] = _sensenova_thinking_body()
+        _apply_thinking_params(
+            params,
+            model=self.model,
+            thinking_enabled=thinking_enabled,
+        )
 
         auth_headers = self._auth_headers(
             self._request_headers(session_id, turn_id, title, call_kind)
@@ -641,6 +660,8 @@ class OpenAIClient(LLMClientBase):
                 prompt_tokens=response.usage.prompt_tokens or 0,
                 completion_tokens=response.usage.completion_tokens or 0,
                 total_tokens=response.usage.total_tokens or 0,
+                input_tokens=response.usage.prompt_tokens or 0,
+                output_tokens=response.usage.completion_tokens or 0,
             )
 
         return LLMResponse(
@@ -741,8 +762,11 @@ class OpenAIClient(LLMClientBase):
             params["model"] = self.model
         if request_params["tools"]:
             params["tools"] = self._convert_tools(request_params["tools"])
-        if thinking_enabled and _is_sensenova_model(self.model):
-            params["extra_body"] = _sensenova_thinking_body()
+        _apply_thinking_params(
+            params,
+            model=self.model,
+            thinking_enabled=thinking_enabled,
+        )
 
         auth_headers = self._auth_headers(
             self._request_headers(session_id, turn_id, title, call_kind)
@@ -846,6 +870,8 @@ class OpenAIClient(LLMClientBase):
                             prompt_tokens=chunk.usage.prompt_tokens or 0,
                             completion_tokens=chunk.usage.completion_tokens or 0,
                             total_tokens=chunk.usage.total_tokens or 0,
+                            input_tokens=chunk.usage.prompt_tokens or 0,
+                            output_tokens=chunk.usage.completion_tokens or 0,
                         )
 
                     if not chunk.choices:

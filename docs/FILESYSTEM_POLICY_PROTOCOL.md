@@ -40,6 +40,7 @@ Box-Agent 的权限引擎是**能力（capability）模型**：每个文件读/�
     "cwd": "/Users/me/work/my-project",
     "_meta": {
       "session_mode": "data_analysis",
+      "permission_mode": "default",
       "filesystem_policy": {
         "session_workspace_root": "/Users/me/work/my-project",
         "allowed_directories": [
@@ -53,23 +54,33 @@ Box-Agent 的权限引擎是**能力（capability）模型**：每个文件读/�
 }
 ```
 
-### 2.2 字段定义
+### 2.2 会话权限模式
+
+`session/new._meta.permission_mode` 可取：
+
+- `default`：显式受限会话。以当前 workspace 为基线，使用本次 session 的 `filesystem_policy`；不会继承全局 `allowed_directories`，也不会暴露可绕过文件权限的 `execute_code`。
+- `full_access`：请求完全文件/命令范围，但它只是请求，不是 authority。只有服务端同时配置 `tools.allow_full_access: true` 才生效；否则 fail closed 到 `default`。
+- 不传：兼容旧客户端，继续遵循服务端配置和原有 officev3 policy。
+
+非字符串或未知值按 `default` 处理。`full_access` 不会关闭危险命令的一次性审批，也不会跳过删除前恢复保护。
+
+### 2.3 字段定义
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `session_workspace_root` | string | 否 | session 的主工作区绝对路径。覆盖 `config.yaml` 中的同名字段。空字符串等价于不传。 |
-| `allowed_directories` | string[] | 否 | 额外白名单。**与 config.yaml 中的同名字段合并**（去重），不会替换。 |
+| `allowed_directories` | string[] | 否 | 额外白名单。显式 `default` 模式下替换全局目录；兼容模式下追加合并。 |
 | `filesystem_scope` | string | 否 | 覆盖默认 scope，取值 `session_workspace` / `user_home` / `custom`。默认 `session_workspace`。 |
 
-### 2.3 合并语义
+### 2.4 合并语义
 
 | 字段 | 来源 | 合并方式 |
 |---|---|---|
 | `session_workspace_root` | config.yaml `officev3.paths.session_workspace_root` | 宿主提供则**覆盖**；否则继承配置 |
-| `allowed_directories` | config.yaml `officev3.permissions.filesystem.allowed_directories` | 宿主提供则**追加合并并去重**；否则继承配置 |
+| `allowed_directories` | config.yaml `officev3.permissions.filesystem.allowed_directories` | `permission_mode=default` 时宿主提供值**替换并去重**，未提供则为空；兼容模式下追加合并 |
 | `filesystem_scope` | config.yaml `officev3.permissions.filesystem.scope` | 宿主提供则**覆盖**；否则继承配置 |
 
-### 2.4 输入校验
+### 2.5 输入校验
 
 后端把 `filesystem_policy` 当作"可信但可能含有宿主开发者失误"的输入：
 
@@ -79,7 +90,7 @@ Box-Agent 的权限引擎是**能力（capability）模型**：每个文件读/�
 - `filesystem_scope` 必须是字符串；不在已知 scope 列表中的值会被引擎在请求时按 "未知 scope，fail closed" 处理（与 config.yaml 同等待遇）。
 - 路径不会 `expanduser()` / `resolve()`，由 `PermissionEngine` 在 check 时延迟解析（与 config.yaml 行为一致）。
 
-### 2.5 不需要传的字段
+### 2.6 不需要传的字段
 
 请**不要**通过 `_meta.filesystem_policy` 传：
 
@@ -96,7 +107,9 @@ session/new
     ↓
 解析 _meta.filesystem_policy（dict 校验）
     ↓
-base_policy = CapabilityPolicy.from_config(config)
+server_cap = config.tools.allow_full_access
+permission_mode = validate_and_cap(_meta.permission_mode, server_cap)
+base_policy = CapabilityPolicy.from_config(config) or restrictive_workspace_policy
     ↓
 base_policy.with_filesystem_overrides(
     session_workspace_root=..., allowed_directories=..., filesystem_scope=...
@@ -109,7 +122,9 @@ PermissionEngine(effective_policy, workspace, grant_store)
   session/permissions session_id=... PermissionEngine created: scope=..., swr=..., allowed_dirs=[...]
 ```
 
-`with_filesystem_overrides` 是**不可变变换**——返回新 `CapabilityPolicy` 实例，原对象不变。`allowed_directories` 走**合并去重**而非替换，所以宿主追加目录不会丢失全局配置。
+`with_filesystem_overrides` 是**不可变变换**——返回新 `CapabilityPolicy` 实例，原对象不变。`allowed_directories` 的合并方式由 `permission_mode` 决定：显式 `default` 替换，旧客户端兼容模式追加。
+
+显式受限会话不会注册 `execute_code` / `sandbox_status`，因为 Jupyter venv + `chdir` 不是 OS 文件系统沙箱。若宿主也没有提供可执行 Python runtime，skill runtime prompt 会明确声明该 session 不可使用 Python，而不会继续宣传 `execute_code`。允许完全访问时，kernel 标识还会绑定内部 ACP session identity；模型提供的同名 `session_id` 不能跨会话共享状态或从 status 中枚举其他会话。
 
 ---
 
@@ -205,7 +220,8 @@ PermissionEngine.check FILESYSTEM_WRITE → allowed=False, escalation=user_home
 
 `tests/test_permissions.py`：
 
-- `TestFilesystemOverrides`：3 个用例，覆盖 `session_workspace_root` 覆盖、`allowed_directories` 合并去重、空参数返回 self。
+- `TestFilesystemOverrides`：覆盖 `session_workspace_root` 覆盖、`allowed_directories` 合并/替换去重、空参数返回 self。
+- ACP 权限用例覆盖无全局 officev3 配置时的 session 目录、非法 `permission_mode`、服务端 full-access 上限和受限会话不暴露 `execute_code`。
 - `TestExtractAbsolutePaths::test_bare_root_dropped` / `test_bare_system_root_dropped` / `test_subpath_under_system_root_kept`：3 个用例，回归裸系统根丢弃。
 
 ---
@@ -217,6 +233,9 @@ PermissionEngine.check FILESYSTEM_WRITE → allowed=False, escalation=user_home
 | 宿主不传 `_meta.filesystem_policy` | 完全沿用 `config.yaml` —— 0.8.26 及之前的行为 |
 | 宿主传空对象 `{}` | 等价于不传 |
 | 宿主只传 `session_workspace_root` | 仅覆盖该字段，`allowed_directories` 与 `filesystem_scope` 沿用配置 |
+| `permission_mode=default` | workspace + 本 session policy；全局 allowed directories 不继承；无 policy 时仅 workspace |
+| `permission_mode=full_access` 且服务端禁止 | fail closed 到 `default` |
+| `permission_mode=full_access` 且服务端允许 | 完全文件范围；危险命令仍逐次审批；Jupyter kernel 按 ACP session 隔离 |
 | 宿主同时还传 deprecated `officev3_permissions_override` | 旧字段会被 WARNING 但忽略；新字段照常生效 |
 
-无破坏性变更。
+受限 session 不再暴露 `execute_code`，这是为关闭真实 Python 进程绕过文件权限所必需的安全收紧。

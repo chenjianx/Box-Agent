@@ -106,9 +106,9 @@ model: "your-model"
 
 ### Staged Context Compression
 
-- **Layer 0 — Large tool results**: Generated-artifact read results are compacted before entering model history. Tool-call arguments are not independently compacted and remain verbatim until a whole-history summary replaces their turn.
-- **Layer 1 — Micro-compact**: Every step, older tool results are replaced with short placeholders. Zero cost, no LLM call.
-- **Layer 2 — Auto-summary**: When tokens exceed the derived threshold (about 104k tokens for user-configured endpoints by default), an LLM call summarizes the conversation. Original data is preserved in logs.
+- **Oversized tool results**: Individual results are persisted immediately when needed; fresh parallel results also share a 50k-character pre-request budget. The model receives a stable preview while full text remains on disk. Read results are exempt and stay bounded by Read's own line/character controls.
+- **Usage-aware auto-summary**: The next request is estimated from the latest real API usage plus subsequent messages. When it reaches the model-derived safety threshold, older history is summarized into a `user` message while bounded recent messages and todo, plan, and skill state are restored.
+- **Tool-call arguments**: Write/edit arguments remain verbatim until a whole-history summary replaces their turn; they are not independently compacted.
 - **Legacy safety guard**: Internal history placeholders from older or externally supplied sessions are rejected if a model tries to reuse them as executable file/code arguments; Box-Agent requests one clean regeneration instead of writing the placeholder to disk.
 
 ### More

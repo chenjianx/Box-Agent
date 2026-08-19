@@ -1184,6 +1184,7 @@ class JupyterSandboxTool(Tool):
         runtime_env: Mapping[str, str] | None = None,
         use_output_dir: bool = True,
         output_dir: str | None = None,
+        process_owner_id: str | None = None,
     ):
         """Initialize sandbox tool.
 
@@ -1192,11 +1193,14 @@ class JupyterSandboxTool(Tool):
             runtime_env: Host runtime environment exported by env_context.
             use_output_dir: Chdir kernels into {workspace}/output when True.
             output_dir: Optional explicit artifact output directory.
+            process_owner_id: Trusted host session identity used to namespace
+                persistent kernels. Model-provided session IDs never cross it.
         """
         self.workspace_dir = workspace_dir
         self.runtime_env = dict(runtime_env or {})
         self.use_output_dir = use_output_dir
         self.output_dir = output_dir
+        self.process_owner_id = (process_owner_id or "").strip()
         self._session_id: Optional[str] = None
 
     @property
@@ -1223,7 +1227,11 @@ class JupyterSandboxTool(Tool):
         """Get current sandbox status."""
         env = self._get_sandbox_env()
         sessions_info = []
-        for sid, session in self._sessions.items():
+        prefix = f"{self.process_owner_id}::" if self.process_owner_id else ""
+        for internal_id, session in self._sessions.items():
+            if prefix and not internal_id.startswith(prefix):
+                continue
+            sid = internal_id[len(prefix) :] if prefix else internal_id
             sessions_info.append({
                 "session_id": sid,
                 "is_alive": session.is_alive(),
@@ -1233,7 +1241,7 @@ class JupyterSandboxTool(Tool):
         status: dict[str, Any] = {
             "current_session_id": self._session_id,
             "sessions": sessions_info,
-            "total_sessions": len(self._sessions),
+            "total_sessions": len(sessions_info),
             "frozen": IS_FROZEN,
         }
         if not IS_FROZEN:
@@ -1252,7 +1260,7 @@ class JupyterSandboxTool(Tool):
         session forces a fresh kernel to be built next time. Best-effort —
         never raises.
         """
-        session = self._sessions.pop(session_id, None)
+        session = self._sessions.pop(self._session_key(session_id), None)
         if session is None:
             return
         try:
@@ -1261,6 +1269,13 @@ class JupyterSandboxTool(Tool):
             # Cleanup is best-effort; the session is already removed from the
             # map so it will be rebuilt regardless.
             pass
+
+    def _session_key(self, session_id: str) -> str:
+        """Bind a model-facing kernel ID to this trusted host session."""
+
+        if not self.process_owner_id:
+            return session_id
+        return f"{self.process_owner_id}::{session_id}"
 
     def _create_session(
         self, session_id: str, workspace: Path, env: SandboxEnvironment
@@ -1442,19 +1457,21 @@ Output formats:
         if session_id is None:
             session_id = self._session_id or str(uuid.uuid4())[:8]
         self._session_id = session_id
+        session_key = self._session_key(session_id)
 
         # Check kernel health if session already exists
-        existing_session = self._sessions.get(self._session_id)
+        existing_session = self._sessions.get(session_key)
         if existing_session and not existing_session.is_alive():
             old_session_id = self._session_id
-            del self._sessions[self._session_id]
+            del self._sessions[session_key]
             existing_session = None
             session_id = str(uuid.uuid4())[:8]
             self._session_id = session_id
-            workspace = self._get_workspace(session_id)
-            session = self._create_session(session_id, workspace, env)
+            session_key = self._session_key(session_id)
+            workspace = self._get_workspace(session_key)
+            session = self._create_session(session_key, workspace, env)
             await session.start()
-            self._sessions[session_id] = session
+            self._sessions[session_key] = session
             return ToolResult(
                 success=False,
                 content="",
@@ -1462,9 +1479,9 @@ Output formats:
             )
 
         # Get or create kernel session
-        if session_id not in self._sessions:
-            workspace = self._get_workspace(session_id)
-            session = self._create_session(session_id, workspace, env)
+        if session_key not in self._sessions:
+            workspace = self._get_workspace(session_key)
+            session = self._create_session(session_key, workspace, env)
             try:
                 await session.start()
             except RuntimeError as e:
@@ -1473,9 +1490,9 @@ Output formats:
                     content="",
                     error=f"KERNEL_START_FAILED: {e}",
                 )
-            self._sessions[session_id] = session
+            self._sessions[session_key] = session
 
-        session = self._sessions[session_id]
+        session = self._sessions[session_key]
 
         # Snapshot files in workspace BEFORE execution to detect new ones
         workspace = session.workspace
@@ -1740,6 +1757,9 @@ class SandboxStatusTool(Tool):
 
     _sandbox_tool: Optional[JupyterSandboxTool] = None
 
+    def __init__(self, sandbox_tool: JupyterSandboxTool | None = None) -> None:
+        self._bound_sandbox_tool = sandbox_tool
+
     @classmethod
     def set_sandbox_tool(cls, tool: JupyterSandboxTool):
         """Set the sandbox tool to query status from."""
@@ -1766,10 +1786,11 @@ and sandbox venv status.
 
     async def execute(self) -> ToolResult:
         """Get sandbox status."""
-        if self._sandbox_tool is None:
+        sandbox_tool = self._bound_sandbox_tool or self._sandbox_tool
+        if sandbox_tool is None:
             return ToolResult(success=False, content="", error="Sandbox not initialized")
 
-        status = self._sandbox_tool.get_status()
+        status = sandbox_tool.get_status()
 
         lines = [
             f"Mode: {'in-process (frozen)' if status.get('frozen') else 'subprocess + venv'}",

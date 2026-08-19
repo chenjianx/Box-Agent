@@ -295,6 +295,10 @@ class PlanReadTool(Tool):
     def parameters(self) -> dict[str, Any]:
         return {"type": "object", "properties": {}}
 
+    def compaction_state(self) -> tuple[str, str]:
+        plan = self._store.get()
+        return "Plan", self._format_plan(plan) if plan is not None else "No current plan."
+
     async def execute(self) -> ToolResult:
         plan = self._store.get()
         if plan is None:

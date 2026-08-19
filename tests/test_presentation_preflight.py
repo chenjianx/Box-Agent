@@ -91,6 +91,8 @@ class _StubAgent:
     extMethod = BoxACPAgent.extMethod
     _llm_prompt = BoxACPAgent._llm_prompt
     _presentation_preflight = BoxACPAgent._presentation_preflight
+    _llm_for_binding = BoxACPAgent._llm_for_binding
+    _utility_llm_for_meta = BoxACPAgent._utility_llm_for_meta
 
 
 def test_skill_owned_preflight_config_is_valid():
@@ -196,6 +198,9 @@ def test_non_new_deck_requests_skip_preflight(text: str, has_existing: bool):
         "先生成一份哈利波特主题 PPT 提示词，然后根据它制作 PPT",
         "把分析结果整理成一份组会 PPT，并附 Excel 统计表",
         "把分析结果做成一份组会 PPT",
+        "制作10页AI质检与智能排产平台融资BP，面向VC",
+        "帮我生成一份商业计划书，包含市场和融资计划",
+        "Create an investor pitch deck for this product",
     ],
 )
 def test_new_deck_requests_enter_preflight(text: str):
@@ -609,7 +614,7 @@ def test_non_referential_request_does_not_inherit_unrelated_rich_context():
 
 
 @pytest.mark.asyncio
-async def test_acp_preflight_uses_lightweight_model_without_session():
+async def test_acp_preflight_uses_main_model_without_session():
     llm = _FakeLLM(
         '{"role":"role_teacher","scene":"scene_training",'
         '"audience":"audience_students","page_count":"page_count_5_10","mode":"normal"}'

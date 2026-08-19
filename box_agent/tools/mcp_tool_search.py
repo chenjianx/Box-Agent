@@ -56,10 +56,15 @@ class ToolSearchTool(Tool):
             "returned by this call is immediately activated for this session and "
             "only those activated hits are added to the next model step; other "
             "deferred catalog tools are not exposed, while alwaysLoad tools remain "
-            "visible without search. Prefer a short capability or one exact tool "
-            "name per search; when several concrete tools are needed, search each "
-            "name separately. Set top_k to however many matching tool "
+            "visible without search. Use query for one keyword search, queries for "
+            "independent bilingual or synonymous searches, or tool_names to activate "
+            "only exact catalog IDs or names. Prefer short capability, server, or tool "
+            "keywords; task-specific operands are tolerated but should be omitted "
+            "when possible. Set top_k to however many matching tool "
             "schemas the task actually needs, including ten or more when appropriate. "
+            "The response reports catalog_tool_count for the applied server scope, "
+            "matched_count after query limits, and activated_count after conflict "
+            "filtering; never infer the catalog total from top_k or matched_count. "
             "This search activates tools but does not execute them."
         )
 
@@ -71,8 +76,29 @@ class ToolSearchTool(Tool):
                 "query": {
                     "type": "string",
                     "description": (
-                        "Capability, action, or tool name. Returned matches are all "
-                        "activated for this session."
+                        "One capability, action, server, or tool keyword query. Kept "
+                        "for compatibility; prefer queries for independent alternatives."
+                    ),
+                },
+                "queries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": (
+                        "Independent keyword queries merged by each tool's best "
+                        "relevance. Use separate Chinese, English, synonym, or exact "
+                        "capability phrases. Prefix matches are supported and "
+                        "unmatched task operands are tolerated."
+                    ),
+                },
+                "tool_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": (
+                        "Exact tool IDs or names to activate, such as "
+                        "mcp:server/tool or server/tool. No fuzzy fallback is used, "
+                        "and unlisted catalog tools remain hidden."
                     ),
                 },
                 "server_name": {
@@ -84,29 +110,79 @@ class ToolSearchTool(Tool):
                     "minimum": 1,
                     "default": 1,
                     "description": (
-                        "Exact maximum number of matches to return and activate. "
-                        "Choose any positive count required by the task; there is no "
-                        "small fixed cap. Unreturned catalog tools remain hidden."
+                        "Exact maximum number of query matches to return and activate; "
+                        "ignored for tool_names. Choose any positive count required by "
+                        "the task; there is no small fixed cap. Unreturned catalog "
+                        "tools remain hidden."
                     ),
                 },
             },
-            "required": ["query"],
+            "anyOf": [
+                {"required": ["query"]},
+                {"required": ["queries"]},
+                {"required": ["tool_names"]},
+            ],
             "additionalProperties": False,
         }
 
     async def execute(
         self,
-        query: str,
+        query: str | None = None,
+        queries: list[str] | None = None,
+        tool_names: list[str] | None = None,
         server_name: str | None = None,
         top_k: int = 1,
     ) -> ToolResult:
+        normalized_server_name = (
+            server_name.strip()
+            if isinstance(server_name, str) and server_name.strip()
+            else None
+        )
+        normalized_queries = [
+            item
+            for item in ([query] if query else []) + (queries or [])
+            if isinstance(item, str) and item.strip()
+        ]
+        normalized_tool_names = [
+            item
+            for item in tool_names or []
+            if isinstance(item, str) and item.strip()
+        ]
+        search_input = {
+            "query": query,
+            "queries": normalized_queries,
+            "tool_names": normalized_tool_names,
+            "server_name": normalized_server_name,
+        }
+        if not normalized_queries and not normalized_tool_names:
+            payload = {
+                "success": False,
+                **search_input,
+                "catalog_tool_count": None,
+                "matched_count": 0,
+                "activated_count": 0,
+                "activated": [],
+                "conflicts": [],
+                "missing": [],
+                "notice": "Provide query, queries, or exact tool_names.",
+            }
+            return ToolResult(
+                success=False,
+                content=json.dumps(payload, ensure_ascii=False),
+                error="Tool search input is empty.",
+            )
+
         if not await self._catalog.wait_until_ready(self._readiness_timeout):
             payload = {
                 "success": False,
-                "query": query,
+                **search_input,
                 "state": "catalog_loading",
+                "catalog_tool_count": None,
+                "matched_count": 0,
+                "activated_count": 0,
                 "activated": [],
                 "conflicts": [],
+                "missing": [],
                 "notice": (
                     "The MCP catalog is still loading. Retry tool_search after the "
                     "runtime readiness update; no empty-catalog conclusion was made."
@@ -118,7 +194,24 @@ class ToolSearchTool(Tool):
                 error="MCP catalog is still loading; retry tool_search shortly.",
             )
 
-        hits = self._catalog.search(query, server_name=server_name, top_k=top_k)
+        catalog_tool_count = sum(
+            1
+            for entry in self._catalog.snapshot()
+            if normalized_server_name is None
+            or entry.server_name == normalized_server_name
+        )
+        missing: list[str] = []
+        if normalized_tool_names:
+            hits, missing = self._catalog.lookup_exact(
+                normalized_tool_names,
+                server_name=normalized_server_name,
+            )
+        else:
+            hits = self._catalog.search_many(
+                normalized_queries,
+                server_name=normalized_server_name,
+                top_k=top_k,
+            )
         activated_results = []
         conflicts = []
         protected_names = (
@@ -168,9 +261,13 @@ class ToolSearchTool(Tool):
             )
         payload = {
             "success": not conflicts or bool(activated_results),
-            "query": query,
+            **search_input,
+            "catalog_tool_count": catalog_tool_count,
+            "matched_count": len(hits),
+            "activated_count": len(activated_results),
             "activated": activated_results,
             "conflicts": conflicts,
+            "missing": missing,
             "notice": (
                 f"Activated exactly {len(activated_results)} returned tool(s) for this "
                 "session. Only these hits (plus explicit eager tools) are callable by "
@@ -179,7 +276,11 @@ class ToolSearchTool(Tool):
                 else (
                     "Matching tools have conflicting model-facing names."
                     if conflicts
-                    else "No matching MCP tools found."
+                    else (
+                        "No exact MCP tools found for the requested tool_names."
+                        if normalized_tool_names
+                        else "No matching MCP tools found."
+                    )
                 )
             ),
         }

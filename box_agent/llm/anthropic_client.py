@@ -321,6 +321,10 @@ class AnthropicClient(LLMClientBase):
                 prompt_tokens=total_input_tokens,
                 completion_tokens=output_tokens,
                 total_tokens=total_input_tokens + output_tokens,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation_tokens,
+                cache_read_input_tokens=cache_read_tokens,
             )
 
         return LLMResponse(
@@ -651,6 +655,10 @@ class AnthropicClient(LLMClientBase):
             prompt_tokens=total_input,
             completion_tokens=output_tokens,
             total_tokens=total_input + output_tokens,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_creation_input_tokens=cache_create_tokens,
+            cache_read_input_tokens=cache_read_tokens,
         )
 
         # Always-on diagnostics, symmetric with the OpenAI client, so the

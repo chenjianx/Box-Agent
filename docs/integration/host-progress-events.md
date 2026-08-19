@@ -41,7 +41,9 @@ uses `X-RACCOON-Call-Kind` to classify the request: `agent_step` for the main
 Agent loop, `title_generate` for title generation, `context_summary` for
 history compression, `memory_extract` for memory maintenance,
 `subagent_step` for sub-agent execution, and `utility` for other internal
-helper calls. The call-kind header is omitted for an ordinary main Agent call;
+helper calls. Controlled presentation steps use `presentation_<stage>` so the
+gateway and latency traces can distinguish research, outline, scaffold, patch,
+and QA generation. The call-kind header is omitted for an ordinary main Agent call;
 the gateway treats an omitted value as `agent_step`. A prompt
 may override the cached title with `_meta.title`, `_meta.session_title`, or
 `_meta.sessionTitle`. If no title is provided, the title defaults to

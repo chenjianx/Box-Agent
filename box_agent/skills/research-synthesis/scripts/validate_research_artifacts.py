@@ -83,6 +83,14 @@ ROUTE_REQUIRED = {
 }
 
 
+def hyphenated_reserved_variant(topic: str, canonical_name: str) -> str | None:
+    """Return the common non-canonical form that replaces the suffix `_` with `-`."""
+    prefix = f"{topic}_"
+    if not canonical_name.startswith(prefix):
+        return None
+    return f"{topic}-{canonical_name[len(prefix):]}"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Validate deep research output files for a topic."
@@ -487,17 +495,52 @@ def main() -> int:
 
         for file_name in required:
             if not (research_dir / file_name).exists():
-                errors.append(f"missing required file: {file_name}")
+                near_match = hyphenated_reserved_variant(args.topic, file_name)
+                if near_match and (research_dir / near_match).exists():
+                    errors.append(
+                        f"missing required file: {file_name}; found non-canonical "
+                        f"near-match {near_match}. Use the exact reserved filename "
+                        f"{file_name}"
+                    )
+                else:
+                    errors.append(f"missing required file: {file_name}")
 
         if len(dim_files) < args.min_dimensions:
             errors.append(
                 f"expected at least {args.min_dimensions} dimension files, found {len(dim_files)}"
             )
+            noncanonical_dims = sorted(research_dir.glob(f"{args.topic}-dim*.md"))
+            if noncanonical_dims:
+                errors.append(
+                    "non-canonical dimension filenames ignored: "
+                    + ", ".join(path.name for path in noncanonical_dims)
+                    + f". Use the exact pattern {args.topic}_dimNN.md"
+                )
 
         if args.route == "A" and not wide_files:
-            errors.append("route A requires at least one wide exploration file")
+            noncanonical_wide = sorted(research_dir.glob(f"{args.topic}-wide*.md"))
+            if noncanonical_wide:
+                errors.append(
+                    "route A requires at least one wide exploration file; found "
+                    "non-canonical near-match(es): "
+                    + ", ".join(path.name for path in noncanonical_wide)
+                    + f". Use the exact pattern {args.topic}_wideNN.md"
+                )
+            else:
+                errors.append("route A requires at least one wide exploration file")
         if not evidence_file.is_file():
-            errors.append(f"missing required file: {evidence_file.name}")
+            near_match = hyphenated_reserved_variant(
+                args.topic,
+                evidence_file.name,
+            )
+            if near_match and (research_dir / near_match).is_file():
+                errors.append(
+                    f"missing required file: {evidence_file.name}; found "
+                    f"non-canonical near-match {near_match}. Use the exact reserved "
+                    f"filename {evidence_file.name}"
+                )
+            else:
+                errors.append(f"missing required file: {evidence_file.name}")
         else:
             evidence_errors, evidence_warnings, evidence_summary = (
                 validate_evidence_ledger(evidence_file, args.topic)

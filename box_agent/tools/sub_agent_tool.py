@@ -29,7 +29,7 @@ from ..events import (
     ToolCallStart,
     WebSearchEvent,
 )
-from ..llm.model_routing import select_auto_model
+from ..llm.model_routing import resolve_model_client
 from ..schema import Message
 from .base import EventEmittingTool, Tool, ToolResult
 from .schema_validation import ToolArgumentIssue
@@ -1012,41 +1012,14 @@ class SubAgentTool(EventEmittingTool):
         skills: tuple[str, ...] = (),
         files: tuple[str, ...] = (),
     ) -> tuple[Any, dict[str, Any]]:
-        candidates = getattr(self._llm, "auto_model_candidates", ())
-        if not isinstance(candidates, (list, tuple)):
-            candidates = ()
-        selected, diagnostic = select_auto_model(
-            candidates,
+        return resolve_model_client(
+            self._llm,
             task=task,
             strategy=strategy,
             required_tools=required_tools,
             skills=skills,
             files=files,
         )
-        if selected is None:
-            return self._llm, diagnostic
-        clone_for_model = getattr(self._llm, "for_model", None)
-        if not callable(clone_for_model):
-            return self._llm, {
-                **diagnostic,
-                "mode": "inherit",
-                "reason": "model_clone_unavailable",
-            }
-        try:
-            return (
-                clone_for_model(
-                    selected["model"],
-                    max_output_tokens=selected.get("maxTokens"),
-                ),
-                diagnostic,
-            )
-        except (TypeError, ValueError) as exc:
-            return self._llm, {
-                **diagnostic,
-                "mode": "inherit",
-                "reason": "model_clone_failed",
-                "error": str(exc),
-            }
 
     async def execute(  # type: ignore[override]
         self,

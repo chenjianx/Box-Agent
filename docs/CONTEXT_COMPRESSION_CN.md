@@ -1,451 +1,147 @@
 # 上下文压缩
 
-Box-Agent 如何在保证正确性、多 provider 兼容性与 prompt cache 友好性的
-前提下，将 LLM 消息历史控制在模型上下文窗口之内。
+Box-Agent 在两个边界控制上下文增长：
 
-## 设计目标与非目标
+1. 工具结果在占满后续模型请求之前按需落盘；
+2. 只有下一次请求接近模型有效输入上限时，才压缩会话历史。
 
-**目标**
-- 让消息列表无限期地保持在 `token_limit` 以下，即便经过数百次工具调用。
-- 严格不变性：任何压缩路径都必须**单调地减少或保持** token 数量。
-  会让历史变大的压缩路径就是 bug。
-- 廉价优先：开销（LLM 调用、延迟、缓存失效）只在更便宜的层无法满足预算时才升级。
-- Provider 中立：在 Anthropic / OpenAI 协议 / DeepSeek / Qwen / MiniMax M2 等
-  各条路径上行为完全一致。
-- 对下游工具无损：事件流、logger、磁盘 artifact 始终持有原始完整数据。
-  **只压缩模型看到的视图**。
+两者彼此独立。工具结果落盘是无损的：完整结果保存在磁盘，模型只看到预览；会话摘要是有损的，因此更晚触发，并显式保留一个有界的工作集。
 
-**非目标**
-- 可逆。一旦在某次运行中被压缩，模型对该步骤的视图就无法恢复。logger 持有
-  原文以供事后排查。
-- 在所有工具输出上保持语义完整。我们针对真实负载中占主导地位的形态
-  （大文件内容、重复的工具调用、长执行轮次）做优化，而非任意 worst case。
+## 请求生命周期
 
-## 架构
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        run_agent_loop step                          │
-│                                                                     │
-│  ┌─────────────────┐    ┌────────────────────┐                      │
-│  │  Layer 1        │    │  Layer 2           │                      │
-│  │  _micro_compact │───▶│  _maybe_summarize  │────┐                 │
-│  │  (每步，        │    │  (token 触发，     │    │                 │
-│  │   0 LLM 调用)   │    │   1 次 LLM 调用)   │    │                 │
-│  └─────────────────┘    └────────────────────┘    │                 │
-│                                                    ▼                │
-│                                          ┌──────────────────┐       │
-│                                          │  LLM.generate_   │       │
-│                                          │  stream(...)     │       │
-│                                          └──────────────────┘       │
-│                                                    │                │
-│                                                    ▼                │
-│                                          ┌──────────────────┐       │
-│                                          │ append assistant │       │
-│                                          │ message          │       │
-│                                          └──────────────────┘       │
-│                                                    │                │
-│                  (abort 路径: cancel/max_tokens/error)              │
-│                                                    ▼                │
-│                                          ┌──────────────────┐       │
-│                                          │ _cleanup_        │       │
-│                                          │ incomplete_      │       │
-│                                          │ messages         │       │
-│                                          └──────────────────┘       │
-│                                                    │                │
-│                                                    ▼                │
-│                                          ┌──────────────────┐       │
-│                                          │ tool exec        │       │
-│                                          │   │              │       │
-│                                          │   ▼              │       │
-│                                          │ Layer 0          │       │
-│                                          │ _compact_visible │       │
-│                                          │ _tool_content_   │       │
-│                                          │ for_model        │       │
-│                                          │ (按调用，        │       │
-│                                          │  artifact 感知)  │       │
-│                                          └──────────────────┘       │
-│                                                    │                │
-│                                                    ▼                │
-│                                            (下一步)                 │
-└─────────────────────────────────────────────────────────────────────┘
+```text
+工具执行完成
+  -> 检查单个结果
+  -> 追加 tool messages
+  -> 下一次 LLM 请求前检查 fresh 结果总预算
+  -> 估算下一次请求大小
+  -> 达到阈值才压缩历史
+  -> 调用 LLM
 ```
 
-层编号反映的是每层在一个 step **代码顺序中的执行时机**，**不是优先级**：
-Layer 0 在代码顺序中最后执行，但对任何单条 tool 结果来说它是最早作用的一层。
+## 超长工具结果落盘
 
-| 层 | 触发条件 | 成本 | 作用对象 | 压缩范围 |
-| - | -------- | ---- | -------- | -------- |
-| 0 — 模型可见工具内容 | 每次工具调用 | 0 LLM，O(content) | 单条工具结果 | 生成型 artifact 工具输出 |
-| 1 — `_micro_compact` | 每步 | 0 LLM，O(messages) | 整个 `messages` 列表，原地修改 | 旧的 tool-role 消息 |
-| 2 — `_maybe_summarize` | `_estimate_tokens > token_limit` 或 `api_total_tokens > token_limit` | 每轮 1 次 LLM 调用 | 整个 `messages` 列表，整体替换 | assistant + tool 执行序列 |
-| Cleanup — `_cleanup_incomplete_messages` | abort 路径（cancel / max_tokens / 空流 / 错误） | 0 LLM | `messages` 尾部 | 仅当前正在进行的 incomplete turn |
+`box_agent/tool_result_storage.py` 中的 `ToolResultStorage` 统一负责持久化、预览生成和会话内去重。共享执行循环同时用于串行和并行工具；CLI 与 ACP 不复制这套策略。
 
-## Layer 0 — 模型可见工具内容压缩
+### 单结果即时检查
 
-有选择地缩减模型可见历史中的生成型 artifact 内容。工具结果在 append 前压缩；
-工具调用参数不再被单独压缩，在 Layer 2 用整段历史摘要替换其所在轮次前，
-会在后续模型轮次的 assistant 历史中保留原文。工具结果的完整内容仍然：
-- 作为 `ToolCallResult` 发给事件消费者（CLI / ACP / 子 agent），
-- 写入磁盘 `{workspace}/output/`，
-- 在 agent 日志中原文记录。
+默认模型可见结果上限为 20,000 字符。工具可以声明 `max_result_size_chars`，实际使用声明值与默认值中较小者。只有尚未处理的普通结果进入这条通用策略。
 
-**被压缩的工具输出**（`_compact_visible_tool_content_for_model`）
-- 当前仅作用于 `read_file`，且路径匹配 `_path_needs_compact_model_context`
-  的生成型 artifact 启发式规则。
-- 替换格式：
-  ```
-  [Full tool output omitted from model history]
-  Tool: read_file
-  Path: output/deck.html
-  Lines returned: 1240
-  Characters returned: 58213
-  Reason: generated/QA artifact content can bloat future LLM turns;
-  call read_file again with offset/limit if exact content is needed.
+以下结果不会再做二次压缩：
 
-  Preview first 20 lines:
-  …
-  ```
+- 已实际采用工具 `model_context` 的结果会按 `tool_use_id` 冻结；
+- `read_file`、`query_jsonl`、`search_files` 通过 Infinity 明确退出，它们分别依赖行/字符分页、cursor/结构化摘要、结果数/字符分页；
+- `bash`、`bash_output` 也通过 Infinity 退出，因为工具内部已经执行一次 50,000 字符的 40% head + 60% tail 截断。
 
-**占位符执行保护**
-- `box_agent/model_history.py` 中的三个前缀表示旧版/内部历史摘要，不是可执行内容。
-  当前实现不会再把工具调用参数转换为这些占位符。
-- 如果后续模型把它复制进 `write_file`、`append_file`、`edit_file` 或
-  `execute_code`，core 会在 hook、权限检查、artifact 扫描和文件修改前拒绝调用。
-- 第一次出现对用户隐藏，并注入一次重生成请求；重复出现则变成可见工具错误。
-  因为没有发生真实工具执行，修复路径不会消耗工具调用预算。
+读取类工具不会被单结果即时检查外置，避免每个普通分页结果都落盘后又诱导模型重新读取。Infinity 只退出这条即时检查；当多个并行结果的合计内容超过请求总预算时，聚合检查仍可外置其中最大的页面。工具也可通过 `ToolResult.persistence_content` 请求统一落盘完整内容。
 
-**白名单（目前刻意保守）：**
-- 后缀：`.html`、`.htm`、`.json`、`.md`、`.txt`、`.log`、`.xml`
-- 特殊文件名：`qa.json`、`html_self_check.json`、`visual_review.md`、
-  `vision-review-prompt.txt`
-- 路径片段启发式：路径中包含 `qa/` 的任何文件
+符合条件且超过上限时：
 
-路径启发式会为常见生成型 artifact 提供可读预览；纯尺寸兜底仍覆盖其它路径或后缀
-中的大型工具结果。
+- 字符串保存为 `.txt`；
+- 只含 text block 的数组格式化序列化后保存为 `.json`；
+- 文件路径为 `~/.box-agent/sessions/<session>/tool-results/<tool_use_id>.<ext>`；
+- 使用独占创建模式 `x`（等价于 `wx`），已有文件不会被覆盖；
+- 模型侧结果替换为稳定的 `<persisted-output>` 预览。
 
-## Layer 1 — 微压缩（每步）
+以下情况保留原结果：未超过阈值、包含图片或任何非 text block、持久化失败。空输出规范化为 `(<工具名> completed with no output)`，Bash 对应 `(Bash completed with no output)`。
 
-**每次 LLM 调用之前**都运行的、零 LLM 成本的廉价压缩。
+每个 `tool_use_id` 只做一次决策。成功落盘后的替换文本会被缓存，后续循环直接复用，不会重复写文件。恢复会话时已经存在的结果会被冻结，不会被追溯外置。
 
-```python
-def _micro_compact(messages: list[Message]) -> int:
-    """把旧的 tool 结果内容替换为短占位符。
+工具仍可自行保留有界输出；此时通过 `ToolResult.persistence_content` 把完整可落盘文本交给统一边界，真正的写入仍只由 `ToolResultStorage` 完成。Bash 的成功和失败命令都使用这条路径：完整输出保存到磁盘，模型继续看到工具已经生成的 head/tail，并额外得到完整输出路径，不会再被替换成通用的 2,000 字符 head 预览。工具提供的语义化 `model_context` 属于另一层职责，一旦采用也不会被即时检查或 fresh 总预算重复处理。
 
-    Token 感知：保留最近 N 条 tool 结果完整，但如果"最近 N 条本身"
-    就已经超出窗口预算，则收缩 keep 窗口，避免几条超大输出绕过压缩。
+### 预览策略
 
-    任何情况下都至少保留最近 1 条 tool 消息。
-    """
+1. 最多取前 2,000 个字符；
+2. 若该窗口后半段存在换行，优先在最后一个换行处截断；
+3. 否则直接截在第 2,000 个字符；
+4. 只有后面仍有内容时才添加 `...`。
+
+对尚未处理的普通结果，模型看到的形式为：
+
+```text
+<persisted-output>
+Output too large (...). Full output saved to: ...
+
+Preview (first 2.0KB):
+...
+</persisted-output>
 ```
 
-### 算法
+对提供 `persistence_content` 的自截断工具，标签内改为 `Tool-bounded output`，内容是工具已经生成的有界结果，而不是再次生成的通用预览。
 
-```
-tool_indices = messages 中 role == "tool" 的所有下标
+### fresh 结果总预算
 
-# 保守下限
-keep_count = min(_KEEP_RECENT_TOOL_RESULTS, len(tool_indices))   # 3
+每次 LLM 请求前，对本会话首次出现的工具结果执行默认 50,000 字符总预算检查：
 
-# Token 感知收缩 —— 至少保留 1 条
-while keep_count > 1:
-    recent = tool_indices[-keep_count:]
-    if sum(_approx_tokens(msgs[i]) for i in recent) <= _KEEP_RECENT_TOOL_TOKEN_BUDGET:
-        break        # 窗口可接受
-    keep_count -= 1  # 过大，收缩
+1. 只处理 fresh `tool_use_id`；
+2. 排除已经采用 `model_context` 的结果，但仍统计单结果声明为 Infinity 的自处理工具；Infinity 只关闭即时单结果落盘，不代表并行批次可绕过聚合预算；
+3. 按可落盘结果大小从大到小排序；
+4. 总预算路径使用只含恢复路径的包装，并按包装后的模型侧实际长度记账；
+5. 依次持久化并替换最大结果，直到实际剩余 fresh 内容不超过预算。
 
-# 把比 keep 窗口更老的全部压缩
-for idx in tool_indices[:-keep_count]:
-    if len(content) > _MIN_COMPACT_LEN:    # 200
-        messages[idx] = Message(
-            role="tool",
-            content=f"[Previous result from {tool_name}: {first_line[:100]}...]",
-            tool_call_id=...,    # 保留（协议正确性）
-            name=...,            # 保留
-        )
+不支持的 block 和落盘失败结果保持不变。检查时 ID 会被标记为已见，因此后续请求不会反复处理。这条路径专门覆盖并行工具调用：单个结果都没有超限，但合计内容过大。
+
+## 上下文限制压缩
+
+### 触发阈值
+
+```text
+autoCompactThreshold = 0.9 * (context_window - max_output_tokens)
 ```
 
-### 常量
+`LLMConfig.context_token_limit` 会先预留配置的最大输出预算，再从剩余输入预算中保留 10% 作为 token 估算误差和摘要请求的余量。
 
-| 名称 | 值 | 含义 |
-| ---- | -- | ---- |
-| `_KEEP_RECENT_TOOL_RESULTS` | `3` | keep 窗口的下限条数 |
-| `_KEEP_RECENT_TOOL_TOKEN_BUDGET` | `12_000` | 超过此 token 数，keep 窗口开始收缩 |
-| `_MIN_COMPACT_LEN` | `200` | 短于此长度的 tool 结果不值得压缩 |
+### 估算下一次请求
 
-### 性质
+Provider 会把真实 API 响应的 usage 附在对应 assistant message 上。压缩器找到最近一条带真实 usage 的响应，按以下方式得到当时完整上下文：
 
-- **幂等**。被压缩过的 tool 消息长度 < `_MIN_COMPACT_LEN`，下一次调用不会
-  再动它。压缩后的前缀因此是稳定的，**LLM prompt cache 不会被每步打穿**。
-- **协议安全**。`tool_call_id` 与 `name` 被保留，assistant↔tool 消息配对
-  在所有 provider 上仍然有效。
-- **首行锚点**。原始输出的首行被保留在占位符里，这通常是工具最有用的
-  摘要，可以防止模型仅仅为了回忆刚才工具返回了什么而重新调用。
-
-### 行为对比
-
-| 场景 | 旧行为（仅 N-recent） | 新行为（token 感知） |
-| ---- | --------------------- | -------------------- |
-| 10 条小 tool 结果 | 保留最近 3，压缩 7 | 完全相同 |
-| 3 × 50KB `read_file` 结果 | 全 3 条保留（~38k tokens 漏过） | 窗口收缩到 1，压缩 2 条 |
-| 1 × 100KB tool 结果 | 保留 1（正确） | 保留 1（正确，下限永不小于 1） |
-
-## Layer 2 — 摘要（token 触发）
-
-只有在 token 估算超过 `token_limit` 时才触发。每轮（每个 user turn）
-1 次 LLM 调用，然后整个消息列表被替换。
-
-### 触发条件
-
-```python
-estimated = _estimate_tokens(messages)   # tiktoken cl100k_base
-if estimated <= token_limit and api_total_tokens <= token_limit:
-    return None   # 不压缩
+```text
+input_tokens
++ cache_creation_input_tokens
++ cache_read_input_tokens
++ output_tokens
 ```
 
-客户端估算和 provider 上报的 `api_total_tokens` **都**必须低于阈值，
-任一超过都会触发。
+然后对这条响应之后新增的消息做保守估算。若没有真实 API usage，则对整个待发送请求（包括工具 schema）取 `字符数 / 4` 与 UTF-8 字节数 `/ 3` 中较大者，避免中文及其他多字节文本被严重低估。
 
-`token_limit` 来源于 `AgentConfig`：
-```
-context_token_limit = int((context_window - max_output_tokens) * 0.9)
-```
-Box-Agent 默认 `context_window = 180_000`。用户自配 endpoint 省略
-`max_output_tokens` 时默认 `63_999`，推导出 `context_token_limit = 104_400`
-（约 **104k**）；托管的 `xiaohuanxiong.com` endpoint 省略该字段时默认
-`80_000`，推导出 `context_token_limit = 90_000`（约 **90k**）。这些值都可以在
-`config.yaml` 里覆盖。10% 的预留空间用来吸收 token 估算漂移与摘要请求本身的开销。
+### 压缩后的消息组织
 
-### 算法
+可恢复工作流若能提供一份来自当前文件系统、且未超过 checkpoint 预算的最新检查点，压缩会直接使用该 checkpoint、精确的最新用户消息、协议完整的有界近期消息组和运行状态重建历史；这种 `checkpoint` 模式不调用摘要模型。其他任务才调用一次摘要模型：在原始 message 列表末尾临时追加一条 `user` 摘要指令。历史不会被序列化进新 prompt，也不会分块或滚动摘要，因此摘要请求保留完整的 provider message 前缀，可以复用 KV cache。ACP 通过会话模型路由器解析该调用，并把输出上限限制为 4,096 tokens。自动模式只能在宿主下发的 `autoRouting.models` 模型池中，按摘要任务标签、能力和上下文适配度排序选择；显式选择模式始终锁定原模型，不再切换独立 lite 模型。其他 host 可传入独立摘要客户端，未提供时回退主模型。这次调用不提供工具并关闭 thinking。指令要求按时间顺序列出全部 user message，把所有结构化分析放进唯一的 `<summary>...</summary>` 块，并内置九节输出结构示例。响应必须严格由一个非空 summary 块组成；写入 `Summary:` 后只取标签内部文本，标签本身会被丢弃。摘要请求和本地写回的上限均为 8,000 字符；若重建请求仍超过安全输入限制，同一份摘要会在不增加 provider 调用的前提下依次收紧到 4,000、2,000 字符。摘要调用失败、格式错误或返回空内容时，使用明确标注为有损的确定性有界摘要兜底。
 
-```python
-async def _maybe_summarize(llm, messages, token_limit, api_total_tokens, skip_check):
-    if skip_check:
-        return None, False, 0
-    if estimate(messages) <= token_limit and api_total_tokens <= token_limit:
-        return None, False, estimated
+模型输出包装成以下合成 `user` message：
 
-    user_indices = [i for i, m in enumerate(messages) if m.role == "user" and i > 0]
-    new_messages = [messages[0]]   # 保留 system prompt
+```text
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
 
-    for idx, user_idx in enumerate(user_indices):
-        user_msg = messages[user_idx]
-        exec_msgs = messages[user_idx + 1 : next_user_or_end]
+Summary:
+<模型生成的摘要>
 
-        # 折叠孤立的 summary marker —— 防止陈旧摘要在多轮压缩中堆积
-        if _is_summary_marker(user_msg) and not exec_msgs:
-            continue
-
-        new_messages.append(user_msg)
-
-        if exec_msgs:
-            try:
-                summary = await _create_summary(llm, exec_msgs, idx + 1)
-            except Exception:
-                # 失败路径：丢弃 exec_msgs。token 严格递减，绝不增加。
-                # 对话流保持完整（user_msg 仍在）。
-                summary = ""
-            if summary:
-                new_messages.append(Message(
-                    role="user",
-                    content=f"{_SUMMARY_MARKER}\n\n{summary}",
-                ))
-
-    return new_messages, True, estimated
+Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with "I'll continue" or similar. Pick up the last task as if the break never happened.
 ```
 
-### 轮次边界
+新历史顺序如下：
 
-一"轮" = 一条 user 消息 + 它与下一条 user 消息之间的所有内容。
-system prompt 和 user 消息原样保留；只有一轮内部的 assistant / tool
-执行消息会被摘要。
-
-### Summary marker
-
-每个被摘要的轮次会留下一个标记：
-```
-[Assistant Execution Summary]
-
-<摘要文本>
-```
-存为 `user` 角色的消息（这样下一次 assistant turn 能把它视作上下文）。
-marker 前缀就是常量 `_SUMMARY_MARKER`，被 `_is_summary_marker` 用于在
-后续压缩周期中识别孤立 marker。
-
-### `_create_summary` 契约
-
-```python
-async def _create_summary(llm, messages, round_num) -> str:
-    """单次 LLM 调用。失败抛错。"""
-    response = await llm.generate(
-        messages=[system_role, user_prompt],
-        tools=None,                # 显式 —— 跨 provider 一致
-        thinking_enabled=False,    # 显式 —— 跨 provider 一致
-    )
-    return response.content        # 绝不返回未摘要的输入
+```text
+system message
+摘要 user message
+按规则保留的近期 messages
+运行状态 user message
 ```
 
-Prompt 要求：
-1. 聚焦"完成了什么任务、调用了哪些工具"。
-2. 保留关键执行结果。
-3. 不超过约 800 tokens。
-4. **使用与输入相同的语言**（避免中英文混合会话中的双向翻译开销）。
-5. 不复述 user 内容，只摘要 agent 的执行过程。
+recent 选择统一覆盖 user、assistant 和 tool message；assistant 工具调用与连续 tool results 按组保留。目标上限为 5 条消息、合计 20,000 字符，并始终原样保留最新真实 user message。如果最新完整协议组本身超过字符上限，压缩会保留精确的 assistant 工具调用、参数、result ID、顺序和数量，同时将已经进入 continuation summary 的 assistant reasoning 与 tool-result 正文替换为有界 receipt。只有剩余的精确用户文本、工具调用参数、system 指令、工具 schema、有界摘要和运行状态仍无法放入安全窗口时，才标记为 blocked。
 
-### 性质
+上下文压缩不再发现、重新读取或重放近期文件。
 
-- **Token 单调**。`_maybe_summarize` 的所有路径 —— 摘要成功、摘要失败、
-  孤立 marker 折叠 —— 都严格减少或保持 token 数。旧的反向膨胀 bug
-  （`except` 分支 `return summary_content`）已修复：失败现在丢弃
-  `exec_msgs`，而不是把它替换成一个更大的拼接占位符。
-- **Marker 折叠**。前后相邻、中间没有新 exec_msgs 的 summary marker
-  会折叠成一个，限制了"摘要套摘要"残留物在多轮中的增长。
-- **Provider 一致**。`tools=None` + `thinking_enabled=False` 显式传递。
-  Anthropic / OpenAI / DeepSeek / Qwen / MiniMax M2 各路径产生相同形状
-  的输出 —— 例外：某些会无条件 emit thinking 块的 provider（例如
-  MiniMax M2），线协议开关被遵守，但 provider 行为无法在 Box-Agent 这一
-  层抑制。
+Goal、Todo 和 Plan 通过显式、无副作用的 `compaction_state` 契约读取；压缩不会执行普通工具调用，合并后的运行状态消息上限为 12,000 字符。完整 active skill 指令继续固定在 system message 中，不再通过回放历史 `get_skill` 调用重建。控制策略查询“最新用户文本”时会排除内部摘要与运行状态消息。
 
-## Cleanup — `_cleanup_incomplete_messages`（abort 路径）
+若重建后的请求仍超过安全阈值，结果会标记为 blocked，不会静默发送一个已知超限的请求。
 
-在 `run_agent_loop` 的五个 abort 站点被调用：
+## 相邻保护
 
-| 站点 | 触发原因 |
-| ---- | -------- |
-| Cancel after stream | 用户按 Esc / ACP `cancel` 在流式输出中触发 |
-| `MAX_TOKENS` | provider 以 `finish_reason="length"` 停止 |
-| Cancel before tools | 流式结束后、工具执行前收到 cancel |
-| Empty-args 循环熔断 | 模型连续 `EMPTY_ARGS_LIMIT` 次发出空参数 tool_calls |
-| Cancel after tool | 多个串行工具调用之间收到 cancel |
+write/edit 工具调用参数会保留原文，直到整段历史压缩摘要其所在轮次；当前实现不会再单独将这些参数替换成历史占位符。它与工具结果落盘是两套独立机制。旧会话或外部历史中的遗留占位符仍会被安全保护拦截，不能作为可执行文件或代码参数使用。
 
-### "Incomplete" 的定义
+## 验证
 
-```
-last_assistant       = messages 中最近的 role == "assistant"
-trailing_tool_count  = last_assistant 之后的 tool 消息数
-expected_tool_count  = len(last_assistant.tool_calls or [])
-has_content          = bool(last_assistant.content or last_assistant.thinking)
-
-incomplete = (
-    expected_tool_count > 0 and trailing_tool_count < expected_tool_count
-    or expected_tool_count == 0 and not has_content
-)
-```
-
-- **Incomplete（删除这一 turn）**：assistant 声明了 tool_calls 但至少有一个
-  tool 响应缺失；或 assistant 完全没有产生 content / thinking / tool_calls
-  （provider 在任何输出落地之前就切断了流）。
-- **Complete（保留这一 turn）**：assistant 产生了 content（或 thinking），
-  并且所有声明的 tool_calls 都有对应的 tool 响应。
-
-### 为什么改
-
-旧版"无条件删除最后一个 assistant 起的所有内容"在 5 个 abort 站点里
-有 4 个是正确的，但在 mid-stream cancel 那个站点是**错的** —— 因为那个
-位置 `assistant_msg`（当前 step 的）尚未 append，"最后一个 assistant"
-其实是**上一个已完成**的 turn，旧代码会把它误删，破坏消息列表，导致
-任何续跑都不一致。
-
-新的"按形状判定"对 complete turn 是 no-op（所以已完成的之前 turn 安全），
-对另外 4 个站点行为与旧版完全等价（那里刚 append 的 assistant 确实
-incomplete）。
-
-## Token 估算
-
-`_estimate_tokens` 与 `_approx_tokens_for_content` 都使用
-`tiktoken.get_encoding("cl100k_base")`。在 `ImportError` 或初始化失败时
-回退到 `len(text) // 4`，这是刻意保守的估算（高估英文，对 CJK 大致相符）。
-
-同一个 encoder 服务于三处：
-- Layer 1 keep 窗口的预算判定
-- Layer 2 的触发检查
-- LLM 调试日志中的 payload 摘要（`llm/debug_logging.py`）
-
-这意味着预算数值（`12_000`、`context_token_limit`）是自洽的：一条消息
-对其中一个估算贡献 T token，对另一个估算也贡献 T token。
-
-## Provider 兼容矩阵
-
-| 关注点 | Anthropic | OpenAI 协议 | DeepSeek | Qwen | MiniMax M2 |
-| ------ | --------- | ----------- | -------- | ---- | ---------- |
-| `tools=None` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `thinking_enabled=False` | ✓ | 忽略 | 忽略 | 支持则尊重 | 线协议尊重，provider 仍会 emit |
-| `tool_call_id` 保留 | 必需 | 必需 | 必需 | 必需 | 必需 |
-| Layer 1 占位符形态 | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Layer 2 summary marker 用 `user` 角色 | ✓ | ✓ | ✓ | ✓ | ✓ |
-
-压缩路径中没有任何 provider 特化分支。
-
-## 与相邻系统的交互
-
-- **Logger（`AgentLogger`）**。压缩各层原地修改 `messages`；logger 在任何
-  压缩之前就捕获了原始的 `LLMResponse` / `ToolResult` 载荷。磁盘日志是
-  事后排查的唯一真相源。
-- **Memory extractor**。`MemoryExtractor.maybe_extract` 在 Layer 2 替换
-  `messages` **之前**用一份快照调用（`trigger="pre_summarize"`）。这保证
-  memory 提取看到的是完整的执行细节，而不是摘要后的形态。
-- **事件流**。压缩**永远不**影响事件流 —— 所有消费者（CLI 渲染、ACP、
-  子 agent）看到完整的 `ToolCallResult`、`ContentEvent` 等。模型视图与
-  用户视图刻意分离。
-- **子 agent**。`SubAgentTool` 以自己的 `token_limit`（默认 `50_000`）
-  运行 `run_agent_loop`；所有压缩层都独立作用于子 agent 的消息列表。
-
-## 测试
-
-覆盖位于 `tests/test_core.py`：
-
-| 测试 | 层 | 锁定的不变性 |
-| ---- | -- | ------------ |
-| `test_micro_compact_no_op_when_few_tool_msgs` | 1 | ≤ N 条 tool 消息时不动作 |
-| `test_micro_compact_replaces_old_tool_results` | 1 | 旧的被压缩、近的保留 |
-| `test_micro_compact_preserves_short_content` | 1 | 短于 `_MIN_COMPACT_LEN` 跳过 |
-| `test_micro_compact_preserves_tool_call_id` | 1 | 协议字段保留 |
-| `test_micro_compact_first_line_hint` | 1 | 首行作为锚点保留 |
-| `test_micro_compact_token_budget_shrinks_keep_window_when_recent_oversized` | 1 | Token 感知 keep 窗口 |
-| `test_micro_compact_preserves_at_least_one_recent_when_single_giant` | 1 | 下限被尊重 |
-| `test_create_summary_passes_thinking_disabled_and_no_tools` | 2 | 跨 provider 调用形态 |
-| `test_create_summary_propagates_exceptions` | 2 | 失败抛错（无膨胀） |
-| `test_maybe_summarize_drops_exec_msgs_on_llm_failure` | 2 | Token 单调的失败路径 |
-| `test_maybe_summarize_inserts_summary_marker` | 2 | marker 形态 |
-| `test_maybe_summarize_collapses_orphan_summary_markers` | 2 | marker 不堆积 |
-| `test_maybe_summarize_skip_check_short_circuits` | 2 | `skip_check` 被尊重 |
-| `test_maybe_summarize_below_threshold_noop` | 2 | 未超预算时不动作 |
-| `test_cleanup_keeps_complete_assistant_turn` | cleanup | 完整 turn 不被动 |
-| `test_cleanup_removes_empty_assistant_turn` | cleanup | 空 turn 被删 |
-| `test_cleanup_removes_partial_tool_call_turn` | cleanup | 部分 tool_calls 被删 |
-| `test_cleanup_keeps_complete_tool_call_turn` | cleanup | 所有 tool 响应齐全 → 保留 |
-| `test_cleanup_keeps_thinking_only_assistant` | cleanup | 仅 thinking 也算输出 |
-| `test_cleanup_noop_when_no_assistant_turn` | cleanup | 空对话上 no-op |
-| `test_consecutive_html_writes_remain_visible_in_all_model_turns` | 0 | mutation 正文在后续未摘要的模型轮次中保持原文 |
-| `test_large_generic_tool_arguments_remain_in_model_history` | 0 | 大型非文件参数同样保持原文 |
-| `test_model_history_placeholder_write_is_hidden_and_self_heals` | 0 | 占位符不会写盘，并只触发一次修复 |
-
-## 待优化项
-
-这些项目**当前没有**在实现中，列在这里是为了让后续工作者带着上下文接手。
-
-1. **assistant `thinking` 块的老化**。开启 `deep_think` 后，thinking 块
-   持续累积（每个 8k token 上限）。Layer 1 只动 `role == "tool"`。一个
-   专门针对老 thinking 块的压缩器能帮助长 deep-think 会话避免直接升级到
-   Layer 2。
-2. **增量 Layer 2**。每次触发都重新摘要每一轮，会重复支付 LLM 成本；
-   被标记为"已摘要"的轮次可以在后续触发时短路。
-
-## 文件索引
-
-- `box_agent/core.py` —— 所有压缩代码都在这里：
-  - 常量：`_KEEP_RECENT_TOOL_RESULTS`、`_KEEP_RECENT_TOOL_TOKEN_BUDGET`、
-    `_MIN_COMPACT_LEN`、`_SUMMARY_MARKER`、`_MODEL_CONTEXT_PATH_EXTS`、
-    `_MODEL_CONTEXT_PATH_NAMES`、`_MODEL_CONTEXT_PATH_PARTS`、
-    `_MODEL_CONTEXT_CONTENT_THRESHOLD`
-  - Layer 0：`_compact_visible_tool_content_for_model`、
-    `_model_history_placeholder_argument`、
-    `_path_needs_compact_model_context`
-  - Layer 1：`_micro_compact`、`_approx_tokens_for_content`
-  - Layer 2：`_maybe_summarize`、`_create_summary`、`_is_summary_marker`
-  - Cleanup：`_cleanup_incomplete_messages`
-  - Token 估算：`_estimate_tokens`、`_estimate_tokens_fallback`
-- `box_agent/config.py` —— `AgentConfig.context_token_limit` 属性
-- `box_agent/model_history.py` —— 内部历史占位符前缀与检测器
-- `box_agent/agent.py` —— `Agent.__init__(token_limit=...)` 透传
-- `tests/test_core.py` —— 所有压缩测试
+- `tests/test_tool_result_storage.py`：类型处理、独占写入、预览、Read 单结果豁免、失败保留、去重和总预算排序；
+- `tests/test_core.py`：请求前执行、usage 加增量估算、原始前缀单次摘要、回退估算、近期消息边界与运行状态恢复；
+- `tests/test_auth.py`：阈值推导。

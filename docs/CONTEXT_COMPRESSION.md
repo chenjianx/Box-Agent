@@ -1,492 +1,155 @@
 # Context Compression
 
-How Box-Agent keeps the LLM message history under the model's context
-window while preserving correctness, multi-provider compatibility, and
-prompt-cache friendliness.
+Box-Agent controls context growth at two boundaries:
 
-## Goals & non-goals
+1. Tool results are persisted before they can dominate a later model request.
+2. Conversation history is summarized only when the next request approaches the model's effective input limit.
 
-**Goals**
-- Keep the message list under `token_limit` indefinitely, even across
-  hundreds of tool calls.
-- Strict invariant: every compression path **monotonically reduces or
-  preserves** the token count. A compression path that grows the history
-  is a bug.
-- Cheap-first: cost (LLM calls, latency, cache invalidation) escalates
-  only when cheaper layers cannot meet the budget.
-- Provider-neutral: identical behavior on Anthropic / OpenAI-protocol /
-  DeepSeek / Qwen / MiniMax M2 paths.
-- Lossless for downstream tooling: events, logger, and on-disk artifacts
-  always carry the original, full data. Only the model's view is
-  compressed.
+The two mechanisms are deliberately separate. Tool-result storage is lossless: the complete result remains on disk and the model receives a preview. Context summarization is lossy, so it runs later and preserves a bounded working set.
 
-**Non-goals**
-- Reversibility. Once compressed, the model's view of a step cannot be
-  un-compressed inside the same run. The logger holds the originals for
-  post-mortem inspection.
-- Semantic preservation across all tool outputs. We optimize for the
-  shapes that dominate real workloads (large file content, repeated
-  tool calls, long execution rounds), not arbitrary worst cases.
+## Request lifecycle
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        run_agent_loop step                          │
-│                                                                     │
-│  ┌─────────────────┐    ┌────────────────────┐                      │
-│  │  Layer 1        │    │  Layer 2           │                      │
-│  │  _micro_compact │───▶│  _maybe_summarize  │────┐                 │
-│  │  (every step,   │    │  (token-triggered, │    │                 │
-│  │   0 LLM calls)  │    │   1 LLM call)      │    │                 │
-│  └─────────────────┘    └────────────────────┘    │                 │
-│                                                    ▼                │
-│                                          ┌──────────────────┐       │
-│                                          │  LLM.generate_   │       │
-│                                          │  stream(...)     │       │
-│                                          └──────────────────┘       │
-│                                                    │                │
-│                                                    ▼                │
-│                                          ┌──────────────────┐       │
-│                                          │ append assistant │       │
-│                                          │ message          │       │
-│                                          └──────────────────┘       │
-│                                                    │                │
-│                  (abort path: cancel/max_tokens/error)              │
-│                                                    ▼                │
-│                                          ┌──────────────────┐       │
-│                                          │ _cleanup_        │       │
-│                                          │ incomplete_      │       │
-│                                          │ messages         │       │
-│                                          └──────────────────┘       │
-│                                                    │                │
-│                                                    ▼                │
-│                                          ┌──────────────────┐       │
-│                                          │ tool exec        │       │
-│                                          │   │              │       │
-│                                          │   ▼              │       │
-│                                          │ Layer 0          │       │
-│                                          │ _compact_visible │       │
-│                                          │ _tool_content_   │       │
-│                                          │ for_model        │       │
-│                                          │ (per-call,       │       │
-│                                          │  artifact-aware) │       │
-│                                          └──────────────────┘       │
-│                                                    │                │
-│                                                    ▼                │
-│                                            (next step)              │
-└─────────────────────────────────────────────────────────────────────┘
+```text
+tool finishes
+  -> immediate per-result check
+  -> tool messages are appended
+  -> before the next LLM request, enforce the fresh-result aggregate budget
+  -> estimate the next request size
+  -> compact conversation history only when the threshold is reached
+  -> call the LLM
 ```
 
-Layer numbering reflects when each layer fires within a step, **not**
-priority: Layer 0 fires last in code order but applies first to any
-given tool result.
+## Oversized tool-result storage
 
-| Layer | Trigger | Cost | Operates on | Scope of compression |
-| ----- | ------- | ---- | ----------- | -------------------- |
-| 0 — visible tool content | Per tool call | 0 LLM, O(content) | Single tool result | Generated-artifact tool outputs |
-| 1 — `_micro_compact` | Every step | 0 LLM, O(messages) | Whole `messages` list, in place | Old tool-role messages |
-| 2 — `_maybe_summarize` | `_estimate_tokens > token_limit` or `api_total_tokens > token_limit` | 1 LLM call per round | Whole `messages` list, replaces | Assistant + tool exec sequences |
-| Cleanup — `_cleanup_incomplete_messages` | Abort paths (cancel / max_tokens / empty stream / error) | 0 LLM | Tail of `messages` | Incomplete in-flight turn only |
+`ToolResultStorage` in `box_agent/tool_result_storage.py` owns persistence, preview rendering, and per-conversation deduplication. The shared loop invokes it for both sequential and parallel tools; CLI and ACP do not duplicate this policy.
 
-## Layer 0 — Visible tool content compaction
+### Immediate per-result check
 
-Selectively shrinks generated-artifact content in model-visible history. Tool
-results are compacted before append. Tool-call arguments are not independently
-compacted: they remain verbatim in assistant history across later model turns
-until Layer 2 replaces the containing turn with a whole-history summary. The
-full tool-result content is still:
-- emitted as `ToolCallResult` to event consumers (CLI/ACP/sub-agent),
-- written to disk under `{workspace}/output/`,
-- logged verbatim in the agent log.
+The default maximum model-facing result is 20,000 characters. A tool can expose `max_result_size_chars`; the effective limit is the smaller of the declaration and the default. Only ordinary results that have not already been processed enter this generic policy.
 
-**Compacted tool outputs** (`_compact_visible_tool_content_for_model`)
-- Currently scoped to `read_file` whose path matches the
-  generated-artifact heuristics in `_path_needs_compact_model_context`.
-- Replacement format:
-  ```
-  [Full tool output omitted from model history]
-  Tool: read_file
-  Path: output/deck.html
-  Lines returned: 1240
-  Characters returned: 58213
-  Reason: generated/QA artifact content can bloat future LLM turns;
-  call read_file again with offset/limit if exact content is needed.
+The following results are not processed a second time:
 
-  Preview first 20 lines:
-  …
-  ```
+- a tool result whose `model_context` projection was actually selected is frozen by `tool_use_id`;
+- `read_file`, `query_jsonl`, and `search_files` declare infinity and rely on line/character pagination, cursor/structured summarization, and result-count/character pagination respectively;
+- `bash` and `bash_output` also declare infinity because they already apply one 50,000-character 40% head + 60% tail truncation inside the tool.
 
-**Placeholder execution guard**
-- The three prefixes in `box_agent/model_history.py` identify legacy/internal
-  history summaries, not executable content. Current tool-call arguments are
-  no longer converted into these placeholders.
-- If a later model turn copies one into `write_file`, `append_file`,
-  `edit_file`, or `execute_code`, the core rejects the tool call before hooks,
-  permission checks, artifact scans, or file mutation.
-- The first occurrence is hidden from the user and injects one regeneration
-  request. A repeated occurrence becomes a visible tool error. The repair path
-  does not consume the tool-call budget because no real tool execution occurs.
+Read-like tools are not externalized by the single-result check because persisting every normal page only to make the model read it again would create a loop. Infinity opts out of that immediate check, but a large parallel batch can still externalize its largest pages to satisfy the aggregate request budget. A tool can also request persistence of complete recoverable text through `ToolResult.persistence_content`.
 
-**Whitelist (current, intentionally narrow):**
-- Extensions: `.html`, `.htm`, `.json`, `.md`, `.txt`, `.log`, `.xml`
-- Special filenames: `qa.json`, `html_self_check.json`,
-  `visual_review.md`, `vision-review-prompt.txt`
-- Path-part heuristic: anything under a path containing `qa/`
+When an eligible result exceeds the limit:
 
-The path heuristics provide readable previews for common generated artifacts;
-the size-only fallback still covers large content with other paths/extensions.
+- a string is saved as `.txt`;
+- an array containing only text blocks is serialized as formatted JSON and saved as `.json`;
+- files live under `~/.box-agent/sessions/<session>/tool-results/<tool_use_id>.<ext>`;
+- exclusive-create (`x`, equivalent to `wx`) prevents overwriting an existing result;
+- a stable `<persisted-output>` preview replaces the model-facing content.
 
-## Layer 1 — Micro-compact (every step)
+The original result is preserved when it is below the limit, contains an image or any other non-text block, or cannot be persisted. Empty output is normalized to `(<Tool name> completed with no output)`; for Bash this is `(Bash completed with no output)`.
 
-Cheap, zero-LLM-call compaction that runs **before every LLM call**.
+Each `tool_use_id` receives one decision. A persisted replacement is cached and reused in later loop iterations, so the result is not written repeatedly. Results already present when a session is resumed are frozen and are not retroactively externalized.
 
-```python
-def _micro_compact(messages: list[Message]) -> int:
-    """Replace old tool-result content with short placeholders.
+Tools may still bound their own output for operational reasons. When they do, they pass the complete persistable text through `ToolResult.persistence_content`; only `ToolResultStorage` writes it. Bash uses this path for both successful and failed commands: the complete output is saved, while the model keeps the tool-generated head/tail plus the saved path instead of receiving a second generic 2,000-character head preview. Semantic `model_context` projections remain a separate tool concern; once selected, neither the immediate check nor the fresh aggregate budget processes them again.
 
-    Token-aware: keeps the recent N tool results intact, but shrinks the
-    keep window if those alone bust the per-window token budget so that
-    a few enormous outputs cannot bypass compaction entirely.
+### Preview format
 
-    Always preserves at least the most recent tool message.
-    """
+The preview algorithm:
+
+1. Takes at most the first 2,000 characters.
+2. Prefers the last newline within that window when it lies in the second half.
+3. Otherwise cuts exactly at 2,000 characters.
+4. Adds `...` only when more content exists.
+
+For an ordinary unprocessed result, the model-facing form is:
+
+```text
+<persisted-output>
+Output too large (...). Full output saved to: ...
+
+Preview (first 2.0KB):
+...
+</persisted-output>
 ```
 
-### Algorithm
+For a self-bounded tool that supplies `persistence_content`, the body is labeled `Tool-bounded output` and contains the tool's existing bounded result instead of another generic preview.
 
-```
-tool_indices = indices of messages where role == "tool"
+### Aggregate fresh-result budget
 
-# Conservative lower bound on the keep window
-keep_count = min(_KEEP_RECENT_TOOL_RESULTS, len(tool_indices))   # 3
+Before every LLM request, results first seen during the current conversation are checked against a default 50,000-character aggregate budget. The pass:
 
-# Token-aware shrink — preserves ≥1 tool message
-while keep_count > 1:
-    recent = tool_indices[-keep_count:]
-    if sum(_approx_tokens(msgs[i]) for i in recent) <= _KEEP_RECENT_TOOL_TOKEN_BUDGET:
-        break        # window fits
-    keep_count -= 1  # too large, shrink
+1. Considers only fresh `tool_use_id` values.
+2. Excludes selected `model_context` projections, but still counts self-bounded tools whose per-result declaration is infinity. Infinity disables immediate per-result persistence; it does not exempt a parallel batch from the aggregate budget.
+3. Sorts eligible results from largest to smallest.
+4. Uses a path-only persisted wrapper for this aggregate pass and counts the wrapper's actual model-facing length.
+5. Persists and replaces the largest results until the actual remaining fresh content is at or below the budget.
 
-# Compact everything older than the keep window
-for idx in tool_indices[:-keep_count]:
-    if len(content) > _MIN_COMPACT_LEN:    # 200
-        messages[idx] = Message(
-            role="tool",
-            content=f"[Previous result from {tool_name}: {first_line[:100]}...]",
-            tool_call_id=...,    # preserved (protocol correctness)
-            name=...,            # preserved
-        )
+Unsupported blocks and persistence failures remain unchanged. Since IDs are marked seen during the pass, later requests do not reconsider the same results. This handles a batch of parallel tool calls whose individual results are below the per-result limit but are too large together.
+
+## Context-limit compaction
+
+### Threshold
+
+The trigger is derived from the model's input budget:
+
+```text
+autoCompactThreshold = 0.9 * (context_window - max_output_tokens)
 ```
 
-### Constants
+`LLMConfig.context_token_limit` reserves the configured maximum output budget,
+then keeps 10% of the remaining input budget as headroom for estimation drift
+and the summary request.
 
-| Name | Value | Meaning |
-| ---- | ----- | ------- |
-| `_KEEP_RECENT_TOOL_RESULTS` | `3` | Lower bound on the keep window |
-| `_KEEP_RECENT_TOOL_TOKEN_BUDGET` | `12_000` | Token cap above which the keep window starts shrinking |
-| `_MIN_COMPACT_LEN` | `200` | Tool results shorter than this are not worth compacting |
+### Estimating the next request
 
-### Properties
+Provider clients attach usage metadata to the assistant message produced by a real API response. Compaction finds the newest such message and computes its complete response context as:
 
-- **Idempotent.** Once a tool message is compacted, its content is short
-  enough (`< _MIN_COMPACT_LEN`) that the next invocation will not
-  re-touch it. The compacted prefix is therefore stable, which keeps
-  the LLM prompt cache hot.
-- **Protocol-safe.** `tool_call_id` and `name` are preserved so the
-  assistant↔tool message pairing remains valid for every provider.
-- **First-line anchor.** The first line of the original output is kept
-  in the placeholder; this is usually the tool's most useful summary
-  and prevents the model from re-calling the same tool just to recall
-  what it returned.
-
-### Behavioral examples
-
-| Scenario | Old behavior (N-recent only) | New behavior (token-aware) |
-| -------- | ---------------------------- | -------------------------- |
-| 10 small tool results | Last 3 kept, 7 compacted | Identical |
-| 3 × 50KB `read_file` results | 3 kept (~38k tokens leak through) | Window shrinks to 1, 2 compacted |
-| 1 × 100KB tool result | 1 kept (correct) | 1 kept (correct, never shrinks below 1) |
-
-## Layer 2 — Summarization (token-triggered)
-
-Triggered only when token estimation crosses `token_limit`. One LLM
-call per round (per user turn), then the message list is replaced.
-
-### Trigger condition
-
-```python
-estimated = _estimate_tokens(messages)   # tiktoken cl100k_base
-if estimated <= token_limit and api_total_tokens <= token_limit:
-    return None   # no compaction
+```text
+input_tokens
++ cache_creation_input_tokens
++ cache_read_input_tokens
++ output_tokens
 ```
 
-Both client-side estimate and provider-reported `api_total_tokens` must
-be under the limit; whichever crosses first triggers compaction.
+It then estimates messages appended after that response conservatively. If no message has real API usage, the entire pending request—including tool schemas—is estimated with the larger of `characters / 4` and UTF-8 bytes `/ 3`. This avoids severe under-counting for CJK and other multibyte text.
 
-`token_limit` itself is derived from `AgentConfig`:
-```
-context_token_limit = int((context_window - max_output_tokens) * 0.9)
-```
-Box-Agent defaults to `context_window = 180_000`. For user-configured endpoints,
-omitting `max_output_tokens` defaults to `63_999`, giving
-`context_token_limit = 104_400` (~104k). Hosted `xiaohuanxiong.com` endpoints
-default to `max_output_tokens = 80_000`, giving `context_token_limit = 90_000`
-(~90k). Both values are user-overridable in `config.yaml`. The 10% headroom
-absorbs token-estimate drift and the summarization request itself.
+### Compacted message layout
 
-### Algorithm
+When a recoverable workflow provides a current filesystem-derived checkpoint that fits the bounded checkpoint budget, compaction rebuilds directly from that checkpoint, the exact latest user message, the protocol-complete bounded recent group, and runtime state. This `checkpoint` mode performs no summary-model call. Other turns make one summary request by appending a temporary `user` instruction to the exact existing message list. It does not serialize messages into a new prompt and does not split or roll the source. This preserves the complete provider message prefix so the summary request can reuse its KV cache. ACP resolves this call through the session model router and caps it at 4,096 output tokens. Automatic sessions may select only from the host-provided `autoRouting.models` pool, ranked by the summary task tags, ability, and context fit. Explicitly selected sessions stay on that exact model; there is no independent lite-model switch. Other hosts may supply a dedicated summary client or fall back to the main client. Tools and thinking are disabled. The instruction requires a chronological list of every user message and places all structured analysis inside one `<summary>...</summary>` block, with an embedded nine-section output example. The response must consist of exactly one non-empty summary block; only its inner text is written after `Summary:` and the tags are discarded. The requested and locally enforced summary limit is 8,000 characters; if the rebuilt request still exceeds the safe input limit, the same summary is deterministically tightened to 4,000 and finally 2,000 characters without another provider call. If the call fails, is malformed, or returns empty output, an explicitly lossy deterministic bounded fallback is used.
 
-```python
-async def _maybe_summarize(llm, messages, token_limit, api_total_tokens, skip_check):
-    if skip_check:
-        return None, False, 0
-    if estimate(messages) <= token_limit and api_total_tokens <= token_limit:
-        return None, False, estimated
+The model output is wrapped in this synthetic `user` message:
 
-    user_indices = [i for i, m in enumerate(messages) if m.role == "user" and i > 0]
-    new_messages = [messages[0]]   # keep system prompt
+```text
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
 
-    for idx, user_idx in enumerate(user_indices):
-        user_msg = messages[user_idx]
-        exec_msgs = messages[user_idx + 1 : next_user_or_end]
+Summary:
+<model-generated summary>
 
-        # Drop orphan summary markers — prevents stale summaries from
-        # piling up across many compaction cycles.
-        if _is_summary_marker(user_msg) and not exec_msgs:
-            continue
-
-        new_messages.append(user_msg)
-
-        if exec_msgs:
-            try:
-                summary = await _create_summary(llm, exec_msgs, idx + 1)
-            except Exception:
-                # Failure path: DROP exec_msgs. Token count strictly
-                # decreases, never increases. Conversation flow stays
-                # intact (user_msg is still there).
-                summary = ""
-            if summary:
-                new_messages.append(Message(
-                    role="user",
-                    content=f"{_SUMMARY_MARKER}\n\n{summary}",
-                ))
-
-    return new_messages, True, estimated
+Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with "I'll continue" or similar. Pick up the last task as if the break never happened.
 ```
 
-### Round boundaries
+The rebuilt history is ordered as follows:
 
-A "round" = one user message and everything between it and the next
-user message. The system prompt and user messages are preserved as-is;
-only the assistant/tool exec messages within a round get summarized.
-
-### Summary markers
-
-Each summarized round leaves a sentinel:
-```
-[Assistant Execution Summary]
-
-<summary text>
-```
-Stored as a `user`-role message (so the next assistant turn sees it as
-context). The marker prefix is the constant `_SUMMARY_MARKER` and is
-used by `_is_summary_marker` to detect orphan markers in subsequent
-compaction cycles.
-
-### `_create_summary` contract
-
-```python
-async def _create_summary(llm, messages, round_num) -> str:
-    """Single LLM call. Raises on failure."""
-    response = await llm.generate(
-        messages=[system_role, user_prompt],
-        tools=None,                # explicit — uniform across providers
-        thinking_enabled=False,    # explicit — uniform across providers
-    )
-    return response.content        # NEVER returns the un-summarized input
+```text
+system message
+summary user message
+bounded recent messages
+runtime-state user message
 ```
 
-Prompt requirements:
-1. Focus on tasks completed and tools called.
-2. Keep key execution results.
-3. Under ~800 tokens.
-4. **Use the same language as the input** (avoids EN↔ZH double
-   translation in mixed-language sessions).
-5. Skip user content; summarize agent execution only.
+Recent selection applies to user, assistant, and tool messages. Assistant tool calls stay grouped with their contiguous tool results. Selection targets at most 5 messages and 20,000 total characters, and the latest real user message is always retained verbatim. When the newest complete protocol group alone exceeds the character cap, compaction keeps the exact assistant tool calls, arguments, result IDs, ordering, and result count while replacing already-summarized assistant reasoning and tool-result bodies with bounded receipts. A request is blocked only when the remaining exact user text, tool-call arguments, system instructions, tool schemas, bounded summary, and runtime state still cannot fit.
 
-### Properties
+Compaction does not discover, reread, or replay recent files.
 
-- **Token-monotonic.** Any execution path of `_maybe_summarize` —
-  successful summary, failed summary, orphan-marker collapse — strictly
-  reduces or preserves the token count. The old bloat bug
-  (`return summary_content` in the `except` branch) is fixed: failure
-  now drops `exec_msgs` instead of replacing them with an even larger
-  concatenated placeholder.
-- **Marker collapsing.** Consecutive summary markers with no fresh
-  exec_msgs between them collapse to a single marker, bounding the
-  growth of "summary of summary" residue across many cycles.
-- **Provider-uniform.** `tools=None` + `thinking_enabled=False` are
-  passed explicitly. Anthropic / OpenAI / DeepSeek / Qwen / MiniMax M2
-  paths produce the same shape of output — except for providers that
-  emit thinking blocks unconditionally (e.g. MiniMax M2), where the
-  wire-level toggle is honored but provider behavior cannot be
-  suppressed.
+Current goal, todo, and plan state are read through their explicit, side-effect-free `compaction_state` contract; compaction never invokes a normal tool call. Their combined runtime-state message is capped at 12,000 characters. Full active skill instructions remain pinned in the system message and are not reconstructed by replaying historical `get_skill` calls. Internal summary/runtime-state messages are excluded whenever control policy asks for the latest real user text.
 
-## Cleanup — `_cleanup_incomplete_messages` (abort paths)
+If the rebuilt request still exceeds the safe limit, the outcome is marked blocked instead of silently sending a known-oversized request.
 
-Called from five abort sites in `run_agent_loop`:
+## Adjacent protections
 
-| Site | Trigger |
-| ---- | ------- |
-| Cancel after stream | User pressed Esc / ACP `cancel` during streaming |
-| `MAX_TOKENS` | Provider stopped with `finish_reason="length"` |
-| Cancel before tools | Cancel signal raised after stream, before tool exec |
-| Empty-args loop break | Model repeated empty-arg tool_calls past `EMPTY_ARGS_LIMIT` |
-| Cancel after tool | Cancel signal raised between sequential tool calls |
+Write/edit tool-call arguments remain verbatim until whole-history compaction summarizes their turn; they are not independently replaced with history placeholders. This is separate from tool-result storage. A legacy safety guard still prevents placeholders from older or externally supplied sessions from being reused as executable file or code arguments.
 
-### Definition of "incomplete"
+## Verification
 
-```
-last_assistant = most recent role == "assistant" in messages
-trailing_tool_count = number of tool messages after last_assistant
-expected_tool_count = len(last_assistant.tool_calls or [])
-has_content = bool(last_assistant.content or last_assistant.thinking)
+Direct regression coverage lives in:
 
-incomplete = (
-    expected_tool_count > 0 and trailing_tool_count < expected_tool_count
-    or expected_tool_count == 0 and not has_content
-)
-```
-
-- **Incomplete (delete the turn)**: assistant declared tool_calls but
-  at least one tool response is missing, OR assistant produced no
-  content / thinking / tool_calls at all (provider cut off the stream
-  before any output landed).
-- **Complete (keep the turn)**: assistant produced content (or
-  thinking), and any declared tool_calls all have matching tool
-  responses.
-
-### Why this changed
-
-The previous unconditional "delete from last assistant onwards" was
-correct for 4 of the 5 abort sites but wrong for the
-mid-stream-cancel site, where `assistant_msg` for the current step has
-not yet been appended. There, the "last assistant" is the **previous,
-completed** turn — and the old logic would erase it, corrupting the
-message list for any resumption.
-
-The new shape-based check is a no-op for complete turns (so completed
-prior turns are safe) and behaviorally identical to the old code for
-the other four sites (where the just-appended assistant is genuinely
-incomplete).
-
-## Token estimation
-
-`_estimate_tokens` and `_approx_tokens_for_content` both use
-`tiktoken.get_encoding("cl100k_base")`. On `ImportError` or
-initialization failure they fall back to `len(text) // 4`, which is
-intentionally conservative (overestimates English, roughly matches CJK).
-
-The same encoder is used for:
-- Layer 1 keep-window budget evaluation
-- Layer 2 trigger check
-- LLM debug log payload summarization (`llm/debug_logging.py`)
-
-This means the budget numbers (`12_000`, `context_token_limit`) are
-self-consistent: a message that contributes T tokens to one estimate
-contributes T tokens to the other.
-
-## Provider compatibility matrix
-
-| Concern | Anthropic | OpenAI-compat | DeepSeek | Qwen | MiniMax M2 |
-| ------- | --------- | ------------- | -------- | ---- | ---------- |
-| `tools=None` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `thinking_enabled=False` | ✓ | ignored | ignored | honored where supported | honored on wire, provider still emits |
-| `tool_call_id` preserved | required | required | required | required | required |
-| Layer 1 placeholder shape | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Layer 2 summary marker as `user` role | ✓ | ✓ | ✓ | ✓ | ✓ |
-
-No provider-specific branching anywhere in the compression path.
-
-## Interaction with adjacent systems
-
-- **Logger (`AgentLogger`).** Compaction layers operate on `messages`
-  in place; the logger captures the original `LLMResponse` /
-  `ToolResult` payloads before any compaction. The on-disk log is the
-  source of truth for post-mortem.
-- **Memory extractor.** `MemoryExtractor.maybe_extract` is invoked with
-  a snapshot of `messages` taken **before** Layer 2 replaces them
-  (`trigger="pre_summarize"`). This guarantees memory extraction sees
-  the full execution detail, not the summarized form.
-- **Event stream.** Compression never affects the event stream — all
-  consumers (CLI render, ACP, sub-agent) see full `ToolCallResult`,
-  `ContentEvent`, etc. The model's view and the user's view diverge
-  intentionally.
-- **Sub-agent.** `SubAgentTool` runs `run_agent_loop` with its own
-  `token_limit` (default `50_000`); all compression layers apply
-  independently to the sub-agent's message list.
-
-## Tests
-
-Coverage lives in `tests/test_core.py`:
-
-| Test | Layer | What it locks down |
-| ---- | ----- | ------------------ |
-| `test_micro_compact_no_op_when_few_tool_msgs` | 1 | No-op when ≤ N tool messages |
-| `test_micro_compact_replaces_old_tool_results` | 1 | Compacts old, keeps recent |
-| `test_micro_compact_preserves_short_content` | 1 | Skips below `_MIN_COMPACT_LEN` |
-| `test_micro_compact_preserves_tool_call_id` | 1 | Protocol fields kept |
-| `test_micro_compact_first_line_hint` | 1 | First line preserved as anchor |
-| `test_micro_compact_token_budget_shrinks_keep_window_when_recent_oversized` | 1 | Token-aware keep window |
-| `test_micro_compact_preserves_at_least_one_recent_when_single_giant` | 1 | Lower bound respected |
-| `test_create_summary_passes_thinking_disabled_and_no_tools` | 2 | Cross-provider call shape |
-| `test_create_summary_propagates_exceptions` | 2 | Failure raises (no bloat) |
-| `test_maybe_summarize_drops_exec_msgs_on_llm_failure` | 2 | Token-monotonic failure path |
-| `test_maybe_summarize_inserts_summary_marker` | 2 | Marker shape |
-| `test_maybe_summarize_collapses_orphan_summary_markers` | 2 | No marker pile-up |
-| `test_maybe_summarize_skip_check_short_circuits` | 2 | `skip_check` honored |
-| `test_maybe_summarize_below_threshold_noop` | 2 | No work when under budget |
-| `test_cleanup_keeps_complete_assistant_turn` | cleanup | Complete turn untouched |
-| `test_cleanup_removes_empty_assistant_turn` | cleanup | Empty turn dropped |
-| `test_cleanup_removes_partial_tool_call_turn` | cleanup | Partial tool_calls dropped |
-| `test_cleanup_keeps_complete_tool_call_turn` | cleanup | All tool responses present → keep |
-| `test_cleanup_keeps_thinking_only_assistant` | cleanup | Thinking counts as output |
-| `test_cleanup_noop_when_no_assistant_turn` | cleanup | No-op on bare conversation |
-| `test_consecutive_html_writes_remain_visible_in_all_model_turns` | 0 | Full mutation content remains exact across later unsummarized model turns |
-| `test_large_generic_tool_arguments_remain_in_model_history` | 0 | Large non-file arguments also remain exact |
-| `test_model_history_placeholder_write_is_hidden_and_self_heals` | 0 | Placeholder is never written and gets one repair attempt |
-
-## Open improvements
-
-These are intentionally **not** in the current implementation. They are
-listed here so future work can pick them up with context.
-
-1. **Age out assistant `thinking` blocks.** With `deep_think` enabled,
-   thinking blocks accumulate (up to 8k tokens each). Layer 1 only
-   touches `role == "tool"`. A targeted compactor for old thinking
-   blocks would help long deep-think sessions without escalating to
-   Layer 2.
-2. **Incremental Layer 2.** Re-summarizing every round on every trigger
-   re-pays the LLM cost; tagged-as-summarized rounds could short-circuit
-   on subsequent triggers.
-
-## File reference
-
-- `box_agent/core.py` — all compression code lives here:
-  - Constants: `_KEEP_RECENT_TOOL_RESULTS`, `_KEEP_RECENT_TOOL_TOKEN_BUDGET`,
-    `_MIN_COMPACT_LEN`, `_SUMMARY_MARKER`,
-    `_MODEL_CONTEXT_PATH_EXTS`, `_MODEL_CONTEXT_PATH_NAMES`,
-    `_MODEL_CONTEXT_PATH_PARTS`, `_MODEL_CONTEXT_CONTENT_THRESHOLD`
-  - Layer 0: `_compact_visible_tool_content_for_model`,
-    `_model_history_placeholder_argument`,
-    `_path_needs_compact_model_context`
-  - Layer 1: `_micro_compact`, `_approx_tokens_for_content`
-  - Layer 2: `_maybe_summarize`, `_create_summary`,
-    `_is_summary_marker`
-  - Cleanup: `_cleanup_incomplete_messages`
-  - Token estimation: `_estimate_tokens`, `_estimate_tokens_fallback`
-- `box_agent/config.py` — `AgentConfig.context_token_limit` property
-- `box_agent/model_history.py` — shared internal-placeholder prefixes and detector
-- `box_agent/agent.py` — `Agent.__init__(token_limit=...)` plumbing
-- `tests/test_core.py` — all compression tests
+- `tests/test_tool_result_storage.py` for type handling, exclusive writes, previews, Read single-result opt-out, failures, deduplication, and aggregate ordering;
+- `tests/test_core.py` for pre-request enforcement, usage-plus-delta estimation, exact-prefix one-shot summarization, fallback estimation, bounded retention, and runtime-state restoration;
+- `tests/test_auth.py` for the derived threshold.

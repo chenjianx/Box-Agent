@@ -27,3 +27,29 @@ def test_move_skill_slot_to_end_preserves_prefix_and_single_slot() -> None:
     assert relocated.endswith(SKILL_SLOT_SENTINEL)
     assert relocated.index("prefix") < relocated.index("suffix")
     assert relocated.index("suffix") < relocated.index(SKILL_SLOT_SENTINEL)
+
+
+def test_pptx_skill_makes_scaffold_and_framework_fallback_executable() -> None:
+    skill_path = (
+        Path(__file__).resolve().parents[1]
+        / "box_agent"
+        / "skills"
+        / "document-skills"
+        / "pptx"
+        / "SKILL.md"
+    )
+    skill = skill_path.read_text(encoding="utf-8")
+
+    assert (
+        "Use `cd <artifact-root> && ${BOX_AGENT_NODE:-node}` on that same line"
+        in skill
+    )
+    assert "do not split `cd` and the inspector across lines" in skill
+    assert (
+        "Removing numbers or rewriting a claim as qualitative prose does not verify it"
+        in skill
+    )
+    assert (
+        "the exact unavailable-data placeholder must appear in `message` or `bullets`"
+        in skill
+    )

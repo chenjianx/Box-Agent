@@ -829,6 +829,20 @@ def test_runtime_prompt_mentions_python_node_and_npm_rules(tmp_path: Path) -> No
     assert "禁止 `sudo`" in out
 
 
+def test_runtime_prompt_does_not_advertise_execute_code_when_sandbox_is_disabled(
+    tmp_path: Path,
+) -> None:
+    ctx = build_skill_runtime_context(
+        sandbox_mode=False,
+        node_runtime_root=tmp_path / "missing-node",
+    )
+
+    out = build_skill_runtime_prompt(ctx)
+
+    assert "本 session 不可用" in out
+    assert "仅 `execute_code` 沙箱可用" not in out
+
+
 def test_runtime_prompt_mentions_available_self_managed_node(tmp_path: Path) -> None:
     root = tmp_path / "node-runtime"
     node = root / "versions" / "node" / "bin" / "node"

@@ -7,6 +7,7 @@ an LLM is decided per Agent session by :mod:`mcp_tool_search`.
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -20,12 +21,46 @@ def _normalize(value: str) -> str:
     return re.sub(r"\s+", " ", value)
 
 
+def _tokenize(value: str) -> tuple[str, ...]:
+    """Split searchable metadata into lowercase word-like terms."""
+    return tuple(re.findall(r"[^\W_]+", _normalize(value), flags=re.UNICODE))
+
+
+def _prefix_term_frequency(term: str, field_terms: tuple[str, ...]) -> int:
+    return sum(candidate.startswith(term) for candidate in field_terms)
+
+
+def _bm25_term_score(
+    *,
+    term_frequency: int,
+    document_frequency: int,
+    document_count: int,
+    field_length: int,
+    average_field_length: float,
+) -> float:
+    """Return a small dependency-free BM25 relevance component."""
+    if term_frequency <= 0 or document_frequency <= 0 or document_count <= 0:
+        return 0.0
+    k1 = 1.2
+    b = 0.7
+    inverse_document_frequency = math.log(
+        1 + (document_count - document_frequency + 0.5)
+        / (document_frequency + 0.5)
+    )
+    normalized_length = (
+        field_length / average_field_length if average_field_length > 0 else 1.0
+    )
+    return inverse_document_frequency * (
+        term_frequency * (k1 + 1)
+        / (term_frequency + k1 * (1 - b + b * normalized_length))
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class MCPToolEntry:
     tool_id: str
     model_name: str
     server_name: str
-    raw_tool_name: str
     description: str
     tool: Tool
     generation: int
@@ -130,7 +165,6 @@ class MCPToolCatalog:
                     tool_id=tool_id,
                     model_name=raw_name,
                     server_name=server_name,
-                    raw_tool_name=raw_name,
                     description=tool.description,
                     tool=tool,
                     generation=generation,
@@ -180,43 +214,206 @@ class MCPToolCatalog:
         server_name: str | None = None,
         top_k: int = 5,
     ) -> list[MCPToolEntry]:
+        ranked = self._ranked_search(query, server_name=server_name)
+        return [entry for *_, entry in ranked[: max(1, top_k)]]
+
+    def search_many(
+        self,
+        queries: Iterable[str],
+        *,
+        server_name: str | None = None,
+        top_k: int = 5,
+    ) -> list[MCPToolEntry]:
+        """Merge independent keyword searches using each tool's best rank."""
+        normalized_queries: list[str] = []
+        seen_queries: set[str] = set()
+        for query in queries:
+            normalized_query = _normalize(query)
+            if not normalized_query or normalized_query in seen_queries:
+                continue
+            seen_queries.add(normalized_query)
+            normalized_queries.append(query)
+
+        best_by_tool: dict[
+            str,
+            tuple[int, float, int, int, str, MCPToolEntry],
+        ] = {}
+        for query_index, query in enumerate(normalized_queries):
+            for exact_priority, neg_relevance, neg_matched, tool_id, entry in (
+                self._ranked_search(query, server_name=server_name)
+            ):
+                candidate = (
+                    exact_priority,
+                    neg_relevance,
+                    neg_matched,
+                    query_index,
+                    tool_id,
+                    entry,
+                )
+                current = best_by_tool.get(tool_id)
+                if current is None or candidate[:4] < current[:4]:
+                    best_by_tool[tool_id] = candidate
+
+        ranked = sorted(best_by_tool.values(), key=lambda item: item[:5])
+        return [entry for *_, entry in ranked[: max(1, top_k)]]
+
+    def lookup_exact(
+        self,
+        tool_names: Iterable[str],
+        *,
+        server_name: str | None = None,
+    ) -> tuple[list[MCPToolEntry], list[str]]:
+        """Resolve exact catalog IDs, qualified names, or model names."""
+        entries = [
+            entry
+            for entry in self.snapshot()
+            if server_name is None or entry.server_name == server_name
+        ]
+        resolved: list[MCPToolEntry] = []
+        resolved_ids: set[str] = set()
+        missing: list[str] = []
+        for requested_name in tool_names:
+            normalized_name = _normalize(requested_name)
+            if not normalized_name:
+                continue
+            matches = [
+                entry
+                for entry in entries
+                if normalized_name
+                in {
+                    _normalize(entry.tool_id),
+                    _normalize(f"{entry.server_name}/{entry.model_name}"),
+                    _normalize(f"{entry.server_name}:{entry.model_name}"),
+                    _normalize(entry.model_name),
+                }
+            ]
+            if not matches:
+                missing.append(requested_name)
+                continue
+            for entry in matches:
+                if entry.tool_id in resolved_ids:
+                    continue
+                resolved_ids.add(entry.tool_id)
+                resolved.append(entry)
+        return resolved, missing
+
+    def _ranked_search(
+        self,
+        query: str,
+        *,
+        server_name: str | None = None,
+    ) -> list[tuple[int, float, int, str, MCPToolEntry]]:
         normalized_query = _normalize(query)
-        if not normalized_query:
+        query_terms = tuple(dict.fromkeys(_tokenize(query)))
+        if not normalized_query or not query_terms:
             return []
-        ranked: list[tuple[int, str, MCPToolEntry]] = []
+        documents = []
         for entry in self.snapshot():
             if server_name and entry.server_name != server_name:
                 continue
-            normalized_name = _normalize(entry.model_name)
-            normalized_id = _normalize(entry.tool_id)
-            normalized_server_name = _normalize(
-                f"{entry.server_name} {entry.model_name}"
+            model_terms = tuple(dict.fromkeys(_tokenize(entry.model_name)))
+            model_term_set = set(model_terms)
+            server_terms = tuple(
+                term
+                for term in dict.fromkeys(_tokenize(entry.server_name))
+                if term not in model_term_set
             )
-            normalized_desc = _normalize(entry.description)
+            documents.append(
+                (
+                    entry,
+                    _normalize(entry.model_name),
+                    _normalize(entry.tool_id),
+                    _normalize(f"{entry.server_name} {entry.model_name}"),
+                    model_terms,
+                    server_terms,
+                    tuple(dict.fromkeys(_tokenize(entry.description))),
+                )
+            )
+        if not documents:
+            return []
+
+        average_model_name_length = sum(len(item[4]) for item in documents) / len(
+            documents
+        )
+        average_server_name_length = sum(len(item[5]) for item in documents) / len(
+            documents
+        )
+        average_description_length = sum(len(item[6]) for item in documents) / len(
+            documents
+        )
+        document_frequencies = {
+            term: (
+                sum(_prefix_term_frequency(term, item[4]) > 0 for item in documents),
+                sum(_prefix_term_frequency(term, item[5]) > 0 for item in documents),
+                sum(_prefix_term_frequency(term, item[6]) > 0 for item in documents),
+            )
+            for term in query_terms
+        }
+
+        ranked: list[tuple[int, float, int, str, MCPToolEntry]] = []
+        for (
+            entry,
+            normalized_name,
+            normalized_id,
+            normalized_server_name,
+            model_name_terms,
+            server_name_terms,
+            description_terms,
+        ) in documents:
+            exact_priority = 3
             if normalized_query == normalized_name:
-                score = 0
+                exact_priority = 0
             elif normalized_query == normalized_id:
-                score = 1
-            elif normalized_query in normalized_server_name:
-                score = 2
+                exact_priority = 1
+            elif normalized_query == normalized_server_name:
+                exact_priority = 2
             elif len(normalized_name) >= 3 and normalized_name in normalized_query:
-                # A model may name several concrete tools in one discovery query.
-                # Treat each embedded exact name as a hit instead of requiring
-                # every query word to exist in one tool's metadata.
-                score = 2
-            elif normalized_query in normalized_name:
-                score = 3
-            elif normalized_query in normalized_desc:
-                score = 4
-            else:
-                words = normalized_query.split()
-                haystack = f"{normalized_server_name} {normalized_desc} {normalized_id}"
-                if not all(word in haystack for word in words):
-                    continue
-                score = 5
-            ranked.append((score, entry.tool_id, entry))
-        ranked.sort(key=lambda item: (item[0], item[1]))
-        return [entry for _, _, entry in ranked[: max(1, top_k)]]
+                # Preserve main's compound-query behavior: when the model names
+                # a concrete tool inside a longer request, rank that explicit
+                # selection ahead of fuzzy BM25 matches.
+                exact_priority = 2
+
+            relevance = 0.0
+            matched_terms = 0
+            for term in query_terms:
+                model_name_frequency = _prefix_term_frequency(term, model_name_terms)
+                server_name_frequency = _prefix_term_frequency(term, server_name_terms)
+                description_frequency = _prefix_term_frequency(term, description_terms)
+                if model_name_frequency or server_name_frequency or description_frequency:
+                    matched_terms += 1
+                (
+                    model_name_document_frequency,
+                    server_name_document_frequency,
+                    description_document_frequency,
+                ) = document_frequencies[term]
+                relevance += 2.0 * _bm25_term_score(
+                    term_frequency=model_name_frequency,
+                    document_frequency=model_name_document_frequency,
+                    document_count=len(documents),
+                    field_length=len(model_name_terms),
+                    average_field_length=average_model_name_length,
+                )
+                relevance += 0.5 * _bm25_term_score(
+                    term_frequency=server_name_frequency,
+                    document_frequency=server_name_document_frequency,
+                    document_count=len(documents),
+                    field_length=len(server_name_terms),
+                    average_field_length=average_server_name_length,
+                )
+                relevance += _bm25_term_score(
+                    term_frequency=description_frequency,
+                    document_frequency=description_document_frequency,
+                    document_count=len(documents),
+                    field_length=len(description_terms),
+                    average_field_length=average_description_length,
+                )
+            if exact_priority == 3 and matched_terms == 0:
+                continue
+            ranked.append(
+                (exact_priority, -relevance, -matched_terms, entry.tool_id, entry)
+            )
+        ranked.sort(key=lambda item: item[:4])
+        return ranked
 
     def _rebuild_conflicts(self) -> None:
         counts: dict[str, int] = {}
@@ -227,7 +424,6 @@ class MCPToolCatalog:
                 tool_id=entry.tool_id,
                 model_name=entry.model_name,
                 server_name=entry.server_name,
-                raw_tool_name=entry.raw_tool_name,
                 description=entry.description,
                 tool=entry.tool,
                 generation=entry.generation,

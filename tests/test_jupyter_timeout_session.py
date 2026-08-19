@@ -19,6 +19,7 @@ from box_agent.tools.jupyter_tool import (
     KERNEL_EXEC_TIMEOUT,
     JupyterKernelSession,
     JupyterSandboxTool,
+    SandboxStatusTool,
 )
 
 
@@ -66,6 +67,14 @@ def _bare_session(tmp_path: Path) -> JupyterKernelSession:
     return JupyterKernelSession("s", tmp_path / "ws", sandbox_env=object())
 
 
+class _OwnedSession:
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace
+
+    def is_alive(self) -> bool:
+        return True
+
+
 def test_low_level_execute_returns_timeout_sentinel_when_kernel_stays_busy(tmp_path):
     """The actual JupyterKernelSession.execute() must surface a hard-timeout
     sentinel (not silently succeed) when the idle status never arrives."""
@@ -77,6 +86,41 @@ def test_low_level_execute_returns_timeout_sentinel_when_kernel_stays_busy(tmp_p
     assert error == KERNEL_EXEC_TIMEOUT
     assert stdout == ""
     assert images == []
+
+
+@pytest.mark.asyncio
+async def test_kernel_and_status_state_are_namespaced_by_host_session(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(JupyterSandboxTool, "_sessions", {})
+    first = JupyterSandboxTool(
+        workspace_dir=str(tmp_path / "first"),
+        process_owner_id="acp-first",
+    )
+    second = JupyterSandboxTool(
+        workspace_dir=str(tmp_path / "second"),
+        process_owner_id="acp-second",
+    )
+    first._sessions[first._session_key("first-kernel")] = _OwnedSession(tmp_path / "first")
+    second._sessions[second._session_key("second-kernel")] = _OwnedSession(tmp_path / "second")
+    first._session_id = "first-kernel"
+    second._session_id = "second-kernel"
+
+    assert first._session_key("shared") != second._session_key("shared")
+    assert [item["session_id"] for item in first.get_status()["sessions"]] == ["first-kernel"]
+    assert [item["workspace"] for item in first.get_status()["sessions"]] == [
+        str(tmp_path / "first")
+    ]
+    assert [item["workspace"] for item in second.get_status()["sessions"]] == [
+        str(tmp_path / "second")
+    ]
+
+    first_status = await SandboxStatusTool(first).execute()
+    second_status = await SandboxStatusTool(second).execute()
+    assert "first-kernel" in first_status.content
+    assert "second-kernel" not in first_status.content
+    assert "second-kernel" in second_status.content
+    assert "first-kernel" not in second_status.content
 
 
 def test_low_level_execute_happy_path_still_succeeds(tmp_path):

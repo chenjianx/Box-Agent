@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .schema_validation import (
     ToolArgumentIssue,
@@ -24,7 +24,11 @@ class ToolResult(BaseModel):
     permission_request: dict | None = None  # capability request payload
     raw_output: dict | None = None  # optional structured payload for host UIs
     model_context: str | None = None  # optional compact content for future LLM turns
-    state_checkpoint: str | None = None  # optional canonical state for compaction
+    # Complete persistable text when ``content`` is intentionally bounded by
+    # the tool. The shared result-storage seam consumes it before the
+    # object leaves the execution loop; excluding it avoids duplicating a large
+    # payload in serialized host events.
+    persistence_content: str | None = Field(default=None, exclude=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +43,16 @@ class Tool:
     """Base class for all tools."""
 
     parallel_safe: bool = False
+    # Model-facing results above this size are persisted by the shared agent
+    # loop. Tools that already self-bound output may opt out with ``math.inf``;
+    # they can still hand complete recoverable text to the persistence seam
+    # through ``ToolResult.persistence_content``.
+    max_result_size_chars: float = 50_000
+
+    def compaction_state(self) -> tuple[str, str] | None:
+        """Return trusted read-only runtime state for history compaction."""
+
+        return None
 
     @property
     def name(self) -> str:

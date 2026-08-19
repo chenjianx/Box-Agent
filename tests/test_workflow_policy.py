@@ -17,6 +17,28 @@ from box_agent.workflows.presentation_checkpoint import (
 )
 
 
+def test_controlled_presentation_hides_irrelevant_tools_by_stage(tmp_path):
+    policy = ControlledPresentationPolicy(
+        workspace_dir=str(tmp_path),
+        artifact_root_dir=tmp_path,
+        stage="research",
+    )
+
+    research_hidden = policy.hidden_tool_names()
+    assert "obsidian_create_note" in research_hidden
+    assert "web_search" not in research_hidden
+    assert "browser_navigate" not in research_hidden
+
+    policy.stage = "content_patch"
+    patch_hidden = policy.hidden_tool_names()
+    assert "web_search" in patch_hidden
+    assert "browser_snapshot" in patch_hidden
+    assert "sub_agent" not in patch_hidden
+    assert "get_skill" not in patch_hidden
+    assert "write_file" not in patch_hidden
+    assert policy.llm_call_kind() == "presentation_content_patch"
+
+
 def test_runtime_bridge_preserves_kernel_signature() -> None:
     assert inspect.signature(run_agent_loop) == inspect.signature(core_run_agent_loop)
 

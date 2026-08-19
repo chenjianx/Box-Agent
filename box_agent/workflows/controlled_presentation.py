@@ -99,8 +99,10 @@ _SCAFFOLD_TOOL_ERROR = (
     "intent. Invoke inspect_deck_contract.js once now with only --outline "
     "outline.json and --out deck.json; do not pass layout ids, --theme, "
     "--image-mode, --title, facts, or other optional flags, and do not reread files "
-    "or list the registry. Keep the inspector as the only shell command: do not "
-    "append a pipe, tail, redirection, or another command."
+    "or list the registry. Invoke it on one physical command line using "
+    "`cd <artifact-root> &&`; do not split `cd` and the inspector across lines. "
+    "Keep the inspector as the only shell command: do not append a pipe, tail, "
+    "redirection, or another command."
 )
 _SCAFFOLD_SHELL_SUFFIX_TOOL_ERROR = (
     f"{_SCAFFOLD_TOOL_ERROR} Rejected shell suffix: remove the entire pipe or "
@@ -150,10 +152,10 @@ _IMAGE_STATUS_TOOL_ERROR = (
     "manifest.json or regenerate an existing image."
 )
 _IMAGE_POLICY_REBASE_TOOL_ERROR = (
-    "CONTROLLED_PRESENTATION_IMAGE_POLICY_REBASE_REQUIRED: the latest user "
-    "instruction forbids images. Run the exact rebase_image_policy.js command "
-    "from the latest checkpoint once; do not read or rewrite deck.json or the "
-    "image manifest manually."
+    "CONTROLLED_PRESENTATION_IMAGE_POLICY_REBASE_REQUIRED: the latest checkpoint "
+    "requires a deterministic image-policy rebase. Run the exact "
+    "rebase_image_policy.js command from that checkpoint once; do not read or "
+    "rewrite deck.json or the image manifest manually."
 )
 _FINALIZE_TOOL_ERROR = (
     "CONTROLLED_PRESENTATION_FINALIZE_REQUIRED: run the single deterministic "
@@ -233,6 +235,12 @@ _OUTLINE_TARGET_TOOL_ERROR = (
     "the canonical presentation artifact root. In output mode, use the exact "
     "artifact-relative path outline.json; never use the absolute session-workspace "
     "path. For a large outline, every ordered write_file chunk must use that same path."
+)
+_RESEARCH_ARTIFACT_TARGET_TOOL_ERROR = (
+    "CONTROLLED_PRESENTATION_RESEARCH_ARTIFACT_TARGET_REQUIRED: keep research "
+    "artifacts under the canonical presentation artifact root. Use an "
+    "artifact-relative research/... path; never use an absolute session-workspace "
+    "research path."
 )
 _RESEARCH_SEARCH_COMPLETE_TOOL_ERROR = (
     "CONTROLLED_PRESENTATION_RESEARCH_SEARCH_COMPLETE: bounded research searches "
@@ -336,9 +344,11 @@ _RESEARCH_BROWSER_CONNECTOR_UNAVAILABLE_TOOL_ERROR = (
 )
 _RESEARCH_REVALIDATION_REQUIRED_TOOL_ERROR = (
     "CONTROLLED_PRESENTATION_RESEARCH_REVALIDATION_REQUIRED: research artifacts are "
-    "newer than their QA report. Run exactly the single validate_research_artifacts.py "
-    "command from RESEARCH_INPUT.revalidation.command now. Do not search, browse, "
-    "read, list, rewrite files, append shell commands, or alter its arguments first."
+    "newer than their QA report. Run the single validate_research_artifacts.py "
+    "command from RESEARCH_INPUT.revalidation.command now. You may use it exactly as "
+    "shown or prefix only `cd <artifact-root> &&`; do not search, browse, read, list, "
+    "rewrite files, append shell commands, use pipes/redirections, or alter its "
+    "arguments first."
 )
 
 _PPTX_SCRIPTS_DIR = (
@@ -842,11 +852,14 @@ def _content_patch_repair_error(
 
 def _image_policy_rebase_error(
     stage: str | None,
+    expected_policy: str | None,
     tool_name: str,
     arguments: dict[str, Any],
 ) -> str | None:
     if stage != "image_policy_rebase":
         return None
+    if expected_policy not in {"forbidden", "unavailable", "retry"}:
+        return _IMAGE_POLICY_REBASE_TOOL_ERROR
     command = arguments.get("command")
     if tool_name != "bash" or not isinstance(command, str):
         return _IMAGE_POLICY_REBASE_TOOL_ERROR
@@ -887,7 +900,7 @@ def _image_policy_rebase_error(
         "--manifest",
         "assets/generated/manifest.json",
         "--policy",
-        "forbidden",
+        expected_policy,
     ]:
         return _IMAGE_POLICY_REBASE_TOOL_ERROR
     return None
@@ -1328,18 +1341,17 @@ def _research_handoff_error(
     return _RESEARCH_HANDOFF_TOOL_ERROR
 
 
-def _is_canonical_artifact_target(
+def _resolved_artifact_target(
     value: Any,
-    expected_name: str,
     workspace_dir: str | None,
     artifact_root_dir: str | Path | None,
-) -> bool:
-    """Return whether a tool path resolves to the active artifact-root file."""
+) -> tuple[Path | None, Path | None]:
+    """Resolve a model-supplied path against the active artifact root."""
     if not isinstance(value, str) or not value.strip():
-        return False
+        return None, None
     root = artifact_scan_root(workspace_dir, artifact_root_dir)
     if root is None:
-        return _is_safe_named_path(value, expected_name)
+        return None, None
     root = root.resolve(strict=False)
     candidate = Path(value).expanduser()
     if candidate.is_absolute():
@@ -1365,7 +1377,60 @@ def _is_canonical_artifact_target(
             resolved = (workspace / candidate).resolve(strict=False)
         else:
             resolved = (root / candidate).resolve(strict=False)
+    return resolved, root
+
+
+def _is_canonical_artifact_target(
+    value: Any,
+    expected_name: str,
+    workspace_dir: str | None,
+    artifact_root_dir: str | Path | None,
+) -> bool:
+    """Return whether a tool path resolves to the active artifact-root file."""
+    resolved, root = _resolved_artifact_target(
+        value,
+        workspace_dir,
+        artifact_root_dir,
+    )
+    if root is None:
+        return _is_safe_named_path(value, expected_name)
     return resolved == (root / expected_name).resolve(strict=False)
+
+
+def _research_artifact_target_error(
+    stage: str | None,
+    tool_name: str,
+    arguments: dict[str, Any],
+    workspace_dir: str | None,
+    artifact_root_dir: str | Path | None,
+) -> str | None:
+    """Reject durable research writes outside artifact-root/research/."""
+    if stage != "research":
+        return None
+    candidate: Any = None
+    if tool_name in {"write_file", "append_file", "edit_file"}:
+        candidate = arguments.get("path")
+    elif tool_name == "staged_file_write" and arguments.get("action") == "begin":
+        candidate = arguments.get("path")
+    if not isinstance(candidate, str):
+        return None
+    if "research" not in {part.casefold() for part in Path(candidate).parts}:
+        return None
+    resolved, root = _resolved_artifact_target(
+        candidate,
+        workspace_dir,
+        artifact_root_dir,
+    )
+    if resolved is None or root is None:
+        return None
+    research_root = (root / "research").resolve(strict=False)
+    if resolved.is_relative_to(research_root):
+        return None
+    return (
+        f"{_RESEARCH_ARTIFACT_TARGET_TOOL_ERROR} "
+        f"actual_path={candidate!r}; expected_path='research/...'; "
+        f"artifact_root={str(root)!r}."
+    )
 
 
 def _outline_target_error(
@@ -1392,7 +1457,16 @@ def _outline_target_error(
         artifact_root_dir,
     ):
         return None
-    return _OUTLINE_TARGET_TOOL_ERROR
+    _, root = _resolved_artifact_target(
+        candidate,
+        workspace_dir,
+        artifact_root_dir,
+    )
+    return (
+        f"{_OUTLINE_TARGET_TOOL_ERROR} "
+        f"actual_path={candidate!r}; expected_path='outline.json'; "
+        f"artifact_root={str(root) if root is not None else None!r}."
+    )
 
 
 def _repair_artifact_name(stage: str | None) -> str | None:
@@ -1476,6 +1550,8 @@ def _scaffold_error(
     command = arguments.get("command")
     if tool_name != "bash" or not isinstance(command, str):
         return _SCAFFOLD_TOOL_ERROR
+    if "\n" in command or "\r" in command:
+        return _SCAFFOLD_TOOL_ERROR
     try:
         tokens = shlex.split(command)
     except ValueError:
@@ -1501,7 +1577,7 @@ def _scaffold_error(
     if not supplied_script.is_absolute() or supplied_script.resolve() != _INSPECT_SCRIPT:
         return _SCAFFOLD_TOOL_ERROR
     command_prefix = tokens[: script_index - 1]
-    if command_prefix and not (
+    if not (
         len(command_prefix) == 3
         and command_prefix[0] == "cd"
         and command_prefix[1]
@@ -1767,12 +1843,14 @@ class ControlledPresentationPolicy:
     research_revalidation: dict[str, Any] | None = None
     repair_stalled: bool = False
     image_auth_blocked: bool = False
+    image_policy_rebase_policy: str | None = None
     research_search_exhausted: bool = False
     apply_patch_repair_allowed: bool = False
     apply_patch_repair_paths: tuple[str, ...] = ()
     _last_checkpoint_text: str | None = None
     _resume_checkpoint: WorkflowPauseCheckpoint | None = None
     _last_step_failure_signature: str | None = None
+
     _step_failure_streak: int = 0
     _repair_failure_stage: str | None = None
     _repair_failure_signature: str | None = None
@@ -1814,6 +1892,37 @@ class ControlledPresentationPolicy:
     checkpoint_injection_id: ClassVar[str] = CHECKPOINT_MARKER
     evidence_read_batch_size: ClassVar[int] = RESEARCH_READ_BATCH_SIZE
     evidence_read_limit: ClassVar[int] = RESEARCH_DIRECT_READ_LIMIT
+
+    def hidden_tool_names(self) -> frozenset[str]:
+        """Return tools that cannot contribute to the current deck stage."""
+
+        hidden = {
+            "create_scheduled_task",
+            "mcp_config",
+            "obsidian_create_note",
+            "obsidian_update_note",
+            "obsidian_daily_note",
+            "search",
+            "search_task",
+        }
+        if self.stage not in {None, "research"}:
+            hidden.update(
+                {
+                    "tool_search",
+                    "web_search",
+                    "browser_navigate",
+                    "browser_navigate_back",
+                    "browser_snapshot",
+                }
+            )
+        return frozenset(hidden)
+
+    def llm_call_kind(self) -> str:
+        """Expose the current stage for gateway routing and latency tracing."""
+
+        stage = (self.stage or "bootstrap").strip().lower()
+        normalized = re.sub(r"[^a-z0-9_]+", "_", stage).strip("_")
+        return f"presentation_{normalized or 'bootstrap'}"
 
     @property
     def _research_direct_read_complete(self) -> bool:
@@ -1990,14 +2099,14 @@ class ControlledPresentationPolicy:
                 exc,
             )
 
-    def _persist_image_auth_blocked(self) -> None:
-        """Persist a non-retryable image authorization failure across turns."""
+    def _persist_image_auth_blocked(self) -> str | None:
+        """Persist image authorization failure and return the manifest mode."""
         root = artifact_scan_root(self.workspace_dir, self.artifact_root_dir)
         if root is None or not root.is_dir():
-            return
+            return None
         manifests = list(root.rglob("assets/generated/manifest.json"))
         if not manifests:
-            return
+            return None
         try:
             manifest_path = max(
                 manifests,
@@ -2005,13 +2114,15 @@ class ControlledPresentationPolicy:
             )
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
-                return
+                return None
+            mode = payload.get("mode")
+            manifest_mode = mode if isinstance(mode, str) else None
             image_service = {
                 "status": "blocked",
                 "reason": "authorization_401",
             }
             if payload.get("image_service") == image_service:
-                return
+                return manifest_mode
             payload["image_service"] = image_service
             serialized = json.dumps(
                 payload,
@@ -2023,12 +2134,14 @@ class ControlledPresentationPolicy:
             )
             temp_path.write_text(serialized, encoding="utf-8")
             temp_path.replace(manifest_path)
+            return manifest_mode
         except (OSError, json.JSONDecodeError) as exc:
             _log.warning(
                 "controlled_presentation/image_auth_state_write_failed "
                 "error=%s",
                 exc,
             )
+            return None
 
     def update_checkpoint(
         self,
@@ -2102,6 +2215,17 @@ class ControlledPresentationPolicy:
             self._content_patch_staged_write_id = None
         if next_stage != "apply_patch":
             self._apply_patch_staged_write_id = None
+        if next_stage == "image_policy_rebase":
+            if "--policy retry" in checkpoint_text:
+                self.image_policy_rebase_policy = "retry"
+            elif "--policy unavailable" in checkpoint_text:
+                self.image_policy_rebase_policy = "unavailable"
+            elif "--policy forbidden" in checkpoint_text:
+                self.image_policy_rebase_policy = "forbidden"
+            else:
+                self.image_policy_rebase_policy = None
+        else:
+            self.image_policy_rebase_policy = None
         self.stage = next_stage
         self.has_patch_input = "\nPATCH_INPUT=" in checkpoint_text
         self.has_scaffold_input = "\nSCAFFOLD_INPUT=" in checkpoint_text
@@ -2234,10 +2358,26 @@ class ControlledPresentationPolicy:
             or not isinstance(command, str)
         ):
             return _RESEARCH_REVALIDATION_REQUIRED_TOOL_ERROR
+        if "\n" in command or "\r" in command:
+            return _RESEARCH_REVALIDATION_REQUIRED_TOOL_ERROR
         try:
-            if shlex.split(command) != shlex.split(expected):
-                return _RESEARCH_REVALIDATION_REQUIRED_TOOL_ERROR
+            actual_tokens = shlex.split(command)
+            expected_tokens = shlex.split(expected)
         except ValueError:
+            return _RESEARCH_REVALIDATION_REQUIRED_TOOL_ERROR
+        if actual_tokens == expected_tokens:
+            return None
+        if len(actual_tokens) != len(expected_tokens) + 3:
+            return _RESEARCH_REVALIDATION_REQUIRED_TOOL_ERROR
+        if actual_tokens[0] != "cd" or actual_tokens[2] != "&&":
+            return _RESEARCH_REVALIDATION_REQUIRED_TOOL_ERROR
+        root = artifact_scan_root(self.workspace_dir, self.artifact_root_dir)
+        if root is None:
+            return _RESEARCH_REVALIDATION_REQUIRED_TOOL_ERROR
+        supplied_root = Path(actual_tokens[1]).expanduser().resolve(strict=False)
+        if supplied_root != root.resolve(strict=False):
+            return _RESEARCH_REVALIDATION_REQUIRED_TOOL_ERROR
+        if actual_tokens[3:] != expected_tokens:
             return _RESEARCH_REVALIDATION_REQUIRED_TOOL_ERROR
         return None
 
@@ -2266,14 +2406,23 @@ class ControlledPresentationPolicy:
             self.workspace_dir,
             self.artifact_root_dir,
         )
+        research_artifact_target_error = _research_artifact_target_error(
+            self.stage,
+            tool_name,
+            arguments,
+            self.workspace_dir,
+            self.artifact_root_dir,
+        )
         if self.stage == "repair_stalled":
             return _REPAIR_STALLED_TOOL_ERROR
         if self.stage == "image_auth_blocked":
             return _IMAGE_AUTH_BLOCKED_TOOL_ERROR
-        if handoff_error is not None:
-            return handoff_error
         if outline_target_error is not None:
             return outline_target_error
+        if research_artifact_target_error is not None:
+            return research_artifact_target_error
+        if handoff_error is not None:
+            return handoff_error
         research_revalidation_error = self._research_revalidation_error(
             tool_name,
             arguments,
@@ -2320,6 +2469,7 @@ class ControlledPresentationPolicy:
             return content_patch_repair_error
         image_policy_rebase_error = _image_policy_rebase_error(
             self.stage,
+            self.image_policy_rebase_policy,
             tool_name,
             arguments,
         )
@@ -2590,11 +2740,13 @@ class ControlledPresentationPolicy:
             and tool_name == "generate_image"
             and _image_result_is_unauthorized(result)
         ):
-            self.image_auth_blocked = True
-            self._persist_image_auth_blocked()
+            manifest_mode = self._persist_image_auth_blocked()
+            self.image_auth_blocked = manifest_mode != "auto"
             _log.warning(
                 "controlled_presentation/image_auth_blocked status=401 "
-                "further_image_calls_stopped=true"
+                "mode=%s hard_blocked=%s further_image_calls_stopped=true",
+                manifest_mode or "unknown",
+                self.image_auth_blocked,
             )
 
         if self.stage == "research" and tool_name == "tool_search":

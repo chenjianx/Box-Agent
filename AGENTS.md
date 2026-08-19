@@ -123,6 +123,11 @@ any boundary, name the last completed boundary and the remaining validation.
 - Do not commit, push, merge, tag, or publish without explicit user authority.
 - Before a commit, inspect `git status`, the intended diff, and the staged diff.
   Stage explicit paths; never use `git add -A` in a dirty checkout.
+- Before opening or updating a pull request, rebase the contributor branch onto
+  the base repository's latest `main` (`upstream/main` for forks or `origin/main`
+  for direct clones). Do not merge `main` into the contributor branch. After
+  rebasing a published branch, push only with explicit user authority and use
+  `--force-with-lease`; never use `--force`.
 - Keep one commit focused on one behavior or subsystem. Use a conventional
   subject such as `feat(tools): ...`, `fix(acp): ...`, `test(memory): ...`, or
   `docs: ...`.
@@ -168,6 +173,30 @@ Pytest is the test runner, with `pytest-asyncio` enabled for async tests. Add or
 ## Collaboration & Review Rules
 
 Use TPR in every non-trivial PR description: Task (what changed and what is out of scope), Proof (tests, probes, logs, screenshots, or generated-manifest checks), and Risk (compatibility, packaging, migration, config, or rollback notes). Keep PRs scoped to one behavior or subsystem. For shared behavior, prefer changes in the shared core (`core.py`, shared tools, config, or schema) and keep CLI / ACP code as thin adapters. If a change affects packaged runtime behavior used by officev3, call out whether source-only tests are enough or whether a runtime rebuild/install/probe is required.
+
+## Automated Review Contract
+
+Repository-specific review policy lives in `docs/PR_REVIEW_STANDARD.md` and
+`docs/PR_REVIEW_STANDARD_CN.md`. The deterministic local CI command lives at
+`general_review/ci/preflight.sh`. Deployment configuration for the generic
+`teamwork_review_agents` service is maintained outside this repository.
+
+Before reviewing a pull request:
+
+1. Read `docs/REVIEW_GUIDE_CN.md` and `docs/PR_REVIEW_STANDARD_CN.md`.
+2. Treat `general_review/ci/preflight.sh` as the source of truth for the local
+   `teamwork/local-ci` gate.
+3. Review the complete merge-base diff between the supplied target and change
+   refs, not only the latest commit or current checkout.
+4. Use the deployment-configured `general-reviewer` role. Its reusable Prompt
+   lives only in the `teamwork_review_agents` checkout and covers design,
+   history/target-branch consistency, and security in one review.
+5. Use `.understand-anything/` only as a navigation index and verify findings
+   against current source, Git history, tests, logs, or probes.
+6. Keep all automated Review Agents read-only. Human maintainers retain final
+   merge authority.
+7. Never commit deployment configuration, credentials, logs, or generated
+   local state.
 
 ## Commit & Pull Request Guidelines
 

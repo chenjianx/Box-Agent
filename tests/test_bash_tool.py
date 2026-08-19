@@ -1,6 +1,7 @@
 """Test cases for Bash Tool."""
 
 import asyncio
+import math
 import os
 import unittest.mock
 
@@ -16,6 +17,11 @@ from box_agent.tools.bash_tool import (
     _truncate_bash_streams,
 )
 from box_agent.tools.argument_limits import MAX_BASH_COMMAND_CHARS
+
+
+def test_bash_tools_opt_out_of_shared_result_compression():
+    assert math.isinf(BashTool.max_result_size_chars)
+    assert math.isinf(BashOutputTool.max_result_size_chars)
 
 
 @pytest.mark.asyncio
@@ -805,6 +811,9 @@ async def test_foreground_output_truncated_when_oversize():
     assert result.raw_output["original_stdout_chars"] > MAX_BASH_OUTPUT_CHARS
     assert result.raw_output["streams_combined"] is True
     assert result.raw_output["max_output_chars"] == MAX_BASH_OUTPUT_CHARS
+    assert result.persistence_content is not None
+    assert len(result.persistence_content) > MAX_BASH_OUTPUT_CHARS
+    assert "persistence_content" not in result.model_dump()
 
 
 @pytest.mark.asyncio
@@ -816,6 +825,7 @@ async def test_foreground_output_normal_size_no_raw_output():
     assert result.success
     assert "hello" in result.stdout
     assert result.raw_output is None
+    assert result.persistence_content is None
 
 
 @pytest.mark.asyncio
@@ -839,6 +849,8 @@ async def test_foreground_large_stderr_failure_is_bounded_without_error_duplicat
     assert result.raw_output is not None
     assert result.raw_output["dropped_chars"] > 0
     assert result.raw_output["original_stderr_chars"] >= 60_000
+    assert result.persistence_content is not None
+    assert len(result.persistence_content) > MAX_BASH_OUTPUT_CHARS
 
 
 @pytest.mark.asyncio
@@ -877,6 +889,8 @@ async def test_background_output_truncated_when_oversize():
         assert "truncated" in output_result.stdout
         assert output_result.raw_output is not None
         assert output_result.raw_output["dropped_chars"] > 0
+        assert output_result.persistence_content is not None
+        assert len(output_result.persistence_content) > MAX_BASH_OUTPUT_CHARS
     finally:
         # Best-effort cleanup so the test doesn't leak a monitor task.
         try:

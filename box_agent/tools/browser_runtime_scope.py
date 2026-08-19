@@ -65,5 +65,11 @@ async def acquire_browser_runtime_for_current_turn() -> None:
         await BrowserRuntimeCoordinator.acquire(owner)
 
 
+async def release_browser_runtime_for_current_turn() -> None:
+    owner = _current_owner.get()
+    if owner is not None:
+        await BrowserRuntimeCoordinator.release(owner)
+
+
 async def release_browser_runtime(owner: str) -> None:
     await BrowserRuntimeCoordinator.release(owner)

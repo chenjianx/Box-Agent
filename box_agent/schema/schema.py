@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class LLMProvider(str, Enum):
@@ -65,6 +65,35 @@ class ToolCall(BaseModel):
     function: FunctionCall
 
 
+class TokenUsage(BaseModel):
+    """Token usage statistics from one real provider response."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    # Internal compaction metadata. Keep the established serialized usage
+    # payload (prompt/completion/total) stable for hosts and trace consumers.
+    input_tokens: int = Field(default=0, exclude=True)
+    output_tokens: int = Field(default=0, exclude=True)
+    cache_creation_input_tokens: int = Field(default=0, exclude=True)
+    cache_read_input_tokens: int = Field(default=0, exclude=True)
+
+    @property
+    def context_tokens(self) -> int:
+        """Return the complete context size represented by this response."""
+
+        explicit = (
+            self.input_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+            + self.output_tokens
+        )
+        if explicit > 0:
+            return explicit
+        compatible_total = self.prompt_tokens + self.completion_tokens
+        return compatible_total if compatible_total > 0 else self.total_tokens
+
+
 class Message(BaseModel):
     """Chat message."""
 
@@ -74,17 +103,7 @@ class Message(BaseModel):
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
     name: str | None = None  # For tool role
-    # Internal canonical state carried across history transforms. LLM adapters
-    # intentionally do not serialize this field to provider message payloads.
-    state_checkpoint: str | None = None
-
-
-class TokenUsage(BaseModel):
-    """Token usage statistics from LLM API response."""
-
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
+    usage: TokenUsage | None = None
 
 
 class LLMResponse(BaseModel):

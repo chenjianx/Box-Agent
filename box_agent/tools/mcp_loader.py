@@ -1,6 +1,7 @@
 """MCP tool loader with real MCP client integration and timeout handling."""
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
@@ -51,7 +52,10 @@ except ImportError:
 from box_agent.auth import request_auth_headers, resolve_auth_token, should_attach_auth_header
 
 from .base import Tool, ToolResult
-from .browser_runtime_scope import acquire_browser_runtime_for_current_turn
+from .browser_runtime_scope import (
+    acquire_browser_runtime_for_current_turn,
+    release_browser_runtime_for_current_turn,
+)
 from .mcp_tool_catalog import get_mcp_tool_catalog
 
 
@@ -326,15 +330,26 @@ class MCPTool(Tool):
         """Execute MCP tool via the session with timeout protection."""
         timeout = self._execute_timeout or _default_timeout_config.execute_timeout
         browser_runtime_acquired = False
+        release_browser_runtime_after_call = False
 
         try:
-            # Browser-lease waiting is part of tool execution. Keeping it inside
-            # the same deadline prevents a busy shared Playwright runtime from
-            # outliving the host's liveness watchdog before call_tool even starts.
+            if self._server_name == "playwright":
+                try:
+                    async with _timeout(min(timeout, 5.0)):
+                        await acquire_browser_runtime_for_current_turn()
+                        browser_runtime_acquired = True
+                except TimeoutError:
+                    return ToolResult(
+                        success=False,
+                        content="",
+                        error=(
+                            "BROWSER_RUNTIME_BUSY: Playwright is currently used by "
+                            "another local-agent turn. Retry later or use a non-browser "
+                            "fallback."
+                        ),
+                    )
+
             async with _timeout(timeout):
-                if self._server_name == "playwright":
-                    await acquire_browser_runtime_for_current_turn()
-                    browser_runtime_acquired = True
                 result = await self._session.call_tool(self._name, arguments=kwargs)
 
             # MCP tool results are a list of content items
@@ -351,28 +366,28 @@ class MCPTool(Tool):
 
             structured_error = _structured_mcp_error_message(content_str)
             if is_error or structured_error:
+                release_browser_runtime_after_call = self._server_name == "playwright"
                 err_msg = structured_error or content_str.strip() or "Tool returned error"
                 return ToolResult(success=False, content=content_str, error=err_msg)
+            release_browser_runtime_after_call = (
+                self._server_name == "playwright"
+                and self._name == "browser_snapshot"
+            )
             return ToolResult(success=True, content=content_str, error=None)
 
         except TimeoutError:
-            if self._server_name == "playwright" and not browser_runtime_acquired:
-                return ToolResult(
-                    success=False,
-                    content="",
-                    error=(
-                        "BROWSER_RUNTIME_BUSY: Playwright is currently used by "
-                        "another local-agent turn. Retry later or use a non-browser "
-                        "fallback."
-                    ),
-                )
+            release_browser_runtime_after_call = browser_runtime_acquired
             return ToolResult(
                 success=False,
                 content="",
                 error=f"MCP tool execution timed out after {timeout}s. The remote server may be slow or unresponsive.",
             )
         except Exception as e:
+            release_browser_runtime_after_call = browser_runtime_acquired
             return ToolResult(success=False, content="", error=f"MCP tool execution failed: {str(e)}")
+        finally:
+            if browser_runtime_acquired and release_browser_runtime_after_call:
+                await release_browser_runtime_for_current_turn()
 
 
 class MCPServerConnection:
@@ -413,6 +428,7 @@ class MCPServerConnection:
         self.always_load = always_load
         # Connection state
         self.last_error: str | None = None
+        self.last_auth_status: int | None = None
         self.session: ClientSession | None = None
         self.exit_stack: AsyncExitStack | None = None
         self.tools: list[MCPTool] = []
@@ -431,6 +447,7 @@ class MCPServerConnection:
 
     async def connect(self) -> bool:
         """Connect to the MCP server with timeout protection."""
+        self.last_auth_status = None
         connect_timeout = self._get_connect_timeout()
         started_at = time.monotonic()
         stage = "open-transport"
@@ -528,7 +545,8 @@ class MCPServerConnection:
         except TimeoutError as e:
             self.last_error = f"Connection timed out after {connect_timeout}s during {stage}"
             cleanup_error = await _close_exit_stack()
-            auth_failure = _is_mcp_authentication_error(cleanup_error)
+            self.last_auth_status = _mcp_auth_status(e, cleanup_error)
+            auth_failure = self.last_auth_status is not None
             if auth_failure:
                 self.last_error = _mcp_connection_error_message(e, cleanup_error)
                 _warn(
@@ -545,8 +563,9 @@ class MCPServerConnection:
 
         except asyncio.CancelledError as e:
             cleanup_error = await _close_exit_stack()
+            self.last_auth_status = _mcp_auth_status(e, cleanup_error)
             self.last_error = _mcp_connection_error_message(e, cleanup_error)
-            if _is_mcp_authentication_error(cleanup_error):
+            if self.last_auth_status is not None:
                 _warn(
                     f"[mcp] connect:failed server={self.name!r} stage={stage} "
                     f"elapsed_ms={elapsed_ms()} error={self.last_error}"
@@ -561,6 +580,7 @@ class MCPServerConnection:
 
         except Exception as e:
             cleanup_error = await _close_exit_stack()
+            self.last_auth_status = _mcp_auth_status(e, cleanup_error)
             self.last_error = _mcp_connection_error_message(e, cleanup_error)
             _warn(
                 f"[mcp] connect:failed server={self.name!r} stage={stage} "
@@ -766,6 +786,7 @@ class McpServerStatus:
     tool_count: int = 0
     tools: list = field(default_factory=list)
     error: str | None = None
+    auth_status: int | None = None
 
 
 _mcp_status: dict[str, McpServerStatus] = {}
@@ -776,6 +797,15 @@ _mcp_config_path: str | None = None
 # DynamicBearer / Authorization headers the cold-start path would build.
 _mcp_auth_file: str = ""
 _mcp_auth_token: str = ""
+_mcp_auth_fingerprint: str = ""
+
+
+def _current_mcp_auth_fingerprint() -> str:
+    """Return a non-reversible marker for the currently resolved login token."""
+    token = resolve_auth_token(_mcp_auth_token, _mcp_auth_file)
+    if not token:
+        return ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def is_mcp_loading() -> bool:
@@ -821,10 +851,17 @@ def _record_status(
     tool_count: int = 0,
     tools: list | None = None,
     error: str | None = None,
+    auth_status: int | None = None,
 ) -> None:
+    if auth_status is None and error:
+        if "HTTP 401" in error or "Authentication failed" in error:
+            auth_status = 401
+        elif "HTTP 403" in error or "Authorization failed" in error:
+            auth_status = 403
     _mcp_status[name] = McpServerStatus(
         name=name, state=state, transport=transport,
         tool_count=tool_count, tools=tools or [], error=error,
+        auth_status=auth_status,
     )
 
 
@@ -837,6 +874,7 @@ def get_mcp_status() -> list[dict]:
             "toolCount": s.tool_count,
             "tools": s.tools,
             "error": s.error,
+            "authStatus": s.auth_status,
         }
         for s in _mcp_status.values()
     ]
@@ -920,7 +958,8 @@ async def load_mcp_tools_async(
     Returns:
         List of Tool objects representing MCP tools
     """
-    global _mcp_connections, _mcp_status, _mcp_loading, _mcp_config_path, _mcp_auth_file, _mcp_auth_token
+    global _mcp_connections, _mcp_status, _mcp_loading, _mcp_config_path
+    global _mcp_auth_file, _mcp_auth_token, _mcp_auth_fingerprint
     _mcp_loading = True
     catalog = get_mcp_tool_catalog()
     catalog.mark_loading()
@@ -928,6 +967,7 @@ async def load_mcp_tools_async(
     # dynamic bearer / Authorization headers it would have used on cold start.
     _mcp_auth_file = auth_file
     _mcp_auth_token = auth_token
+    _mcp_auth_fingerprint = _current_mcp_auth_fingerprint()
     try:
         config_file = _resolve_mcp_config_path(config_path)
         if config_file is not None:
@@ -1024,6 +1064,7 @@ async def load_mcp_tools_async(
                     conn.name, "failed",
                     transport=conn.url or conn.command or "",
                     error=str(success),
+                    auth_status=_mcp_auth_status(success),
                 )
                 continue
             if success:
@@ -1041,6 +1082,7 @@ async def load_mcp_tools_async(
                     conn.name, "failed",
                     transport=conn.url or conn.command or "",
                     error=conn.last_error or "connect() returned False",
+                    auth_status=conn.last_auth_status,
                 )
 
         _warn(f"Total MCP tools loaded: {len(all_tools)}")
@@ -1074,6 +1116,36 @@ async def reconnect_mcp_server(name: str) -> dict:
     lock = _mcp_reconnect_locks.setdefault(name, asyncio.Lock())
     async with lock:
         return await _reconnect_mcp_server_locked(name)
+
+
+async def reconnect_auth_failed_mcp_servers_if_token_changed() -> list[dict]:
+    """Reconnect auth-failed MCP servers after the product login token rotates.
+
+    Hosted MCP discovery happens once during CLI startup. If that initial
+    connection receives a 401, there is no persistent HTTP client on which the
+    dynamic bearer hook can observe a later desktop-login refresh. This helper
+    notices the auth-file change and retries only servers whose last failure was
+    an authentication failure. Connected servers do not need reconnecting:
+    ``DynamicBearerAuth`` already reads the latest token for every request.
+    """
+    global _mcp_auth_fingerprint
+
+    current_fingerprint = _current_mcp_auth_fingerprint()
+    if not current_fingerprint or current_fingerprint == _mcp_auth_fingerprint:
+        return []
+    _mcp_auth_fingerprint = current_fingerprint
+
+    failed_names = [
+        status.name
+        for status in _mcp_status.values()
+        if status.state == "failed"
+        and status.auth_status in {401, 403}
+    ]
+    results: list[dict] = []
+    for name in failed_names:
+        result = await reconnect_mcp_server(name)
+        results.append({"name": name, **result})
+    return results
 
 
 async def _reconnect_mcp_server_locked(name: str) -> dict:
@@ -1157,7 +1229,13 @@ async def _reconnect_mcp_server_locked(name: str) -> dict:
         try:
             success = await conn.connect()
         except Exception as e:
-            _record_status(name, "failed", transport=transport_label, error=str(e))
+            _record_status(
+                name,
+                "failed",
+                transport=transport_label,
+                error=str(e),
+                auth_status=_mcp_auth_status(e),
+            )
             return {"success": False, "error": str(e), "configPath": _mcp_config_path}
 
         if success:
@@ -1171,7 +1249,13 @@ async def _reconnect_mcp_server_locked(name: str) -> dict:
             )
             return {"success": True, "toolCount": len(conn.tools), "tools": [t.name for t in conn.tools], "configPath": _mcp_config_path}
 
-        _record_status(name, "failed", transport=transport_label, error=conn.last_error)
+        _record_status(
+            name,
+            "failed",
+            transport=transport_label,
+            error=conn.last_error,
+            auth_status=conn.last_auth_status,
+        )
         return {"success": False, "error": conn.last_error or "connect() returned False", "configPath": _mcp_config_path}
     finally:
         catalog.mark_server_ready(name)
