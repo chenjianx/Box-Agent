@@ -323,7 +323,7 @@ async def test_set_requires_valid_todos(writer):
 
 
 @pytest.mark.asyncio
-async def test_set_activates_first_unfinished_when_all_items_are_pending(writer):
+async def test_set_rejects_all_pending_items_without_explicit_active_item(writer):
     result = await writer.execute(
         action="set",
         todos=[
@@ -332,11 +332,8 @@ async def test_set_activates_first_unfinished_when_all_items_are_pending(writer)
         ],
     )
 
-    assert result.success
-    assert [item["status"] for item in result.raw_output["items"]] == [
-        "in_progress",
-        "pending",
-    ]
+    assert not result.success
+    assert "found 0" in result.error
 
 
 @pytest.mark.asyncio
@@ -484,20 +481,17 @@ async def test_transition_completes_final_todo_without_next_id(writer):
 
 
 @pytest.mark.asyncio
-async def test_transition_activates_first_pending_when_next_id_is_omitted(writer):
+async def test_transition_requires_explicit_next_id_when_pending_work_remains(writer):
     await writer.execute(action="create", task="Current")
     await writer.execute(action="create", task="Next")
 
     result = await writer.execute(action="transition", todo_id="1")
 
-    assert result.success
-    assert result.raw_output["transition"] == {
-        "completed_id": "1",
-        "in_progress_id": "2",
-    }
-    assert [item["status"] for item in result.raw_output["items"]] == [
-        "completed",
+    assert not result.success
+    assert "'next_todo_id' is required" in result.error
+    assert [item["status"] for item in writer._store.list()] == [
         "in_progress",
+        "pending",
     ]
 
 
@@ -846,8 +840,10 @@ def test_anthropic_schema(writer, reader):
     assert "priority" not in properties
     todo_items_schema = properties["todos"]["items"]
     assert todo_items_schema["required"] == ["task", "status"]
-    assert "activates the first unfinished item automatically" in properties["todos"]["description"]
+    assert "exactly one in_progress item" in properties["todos"]["description"]
     assert "next_todo_id" in properties
+    assert "completion_summary" not in properties
+    assert "evidence" not in properties
 
     schema = reader.to_schema()
     assert schema["name"] == "todo_read"

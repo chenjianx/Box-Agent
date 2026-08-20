@@ -61,17 +61,6 @@ def _todo_state_error(items: list[dict]) -> str | None:
     )
 
 
-def _activate_first_unfinished(items: list[dict]) -> bool:
-    """Activate the first unfinished item when no current item was supplied."""
-    unfinished = [item for item in items if item.get("status") != "completed"]
-    if not unfinished:
-        return False
-    if any(item.get("status") == "in_progress" for item in unfinished):
-        return False
-    unfinished[0]["status"] = "in_progress"
-    return True
-
-
 def _validate_todo_records(items: Any) -> None:
     """Validate todo record shapes without enforcing workflow state."""
     if not isinstance(items, list):
@@ -166,8 +155,9 @@ def _todo_next_instruction(items: list[dict]) -> str:
         )
     return (
         f"Continue only with todo #{current.get('id')}. After completing and verifying "
-        "it, use action='transition' to complete it and automatically activate the first "
-        "pending item. Use action='set' only to initialize or materially rebuild the list."
+        "it, use action='transition' with an explicit next_todo_id to complete it and "
+        "activate the selected pending item. Use action='set' only to initialize or "
+        "materially rebuild the list."
     )
 
 
@@ -368,7 +358,6 @@ class TodoStore:
                     or "pending"
                 )
             })
-        _activate_first_unfinished(candidate_state)
         state_error = _todo_state_error(candidate_state)
         if state_error:
             raise ValueError(state_error)
@@ -439,12 +428,12 @@ class TodoStore:
         current["status"] = "completed"
 
         next_item = None
-        if next_todo_id is None:
-            next_item = next(
-                (item for item in items if item["status"] == "pending"),
-                None,
+        pending_items = [item for item in items if item["status"] == "pending"]
+        if next_todo_id is None and pending_items:
+            raise ValueError(
+                "'next_todo_id' is required while pending work remains."
             )
-        else:
+        if next_todo_id is not None:
             next_item = next(
                 (item for item in items if item["id"] == next_todo_id),
                 None,
@@ -521,8 +510,6 @@ class TodoWriteTool(Tool):
             "Status-only changes to the same ordered list are rejected; use "
             "'transition' for progress. Existing tasks submitted without their canonical "
             "ids are also rejected; call todo_read first if the ids are unavailable. "
-            "If a set payload has unfinished work but no in_progress item, the first "
-            "unfinished item is activated automatically. "
             "When initializing an empty todo list, omit ids; any supplied ids are "
             "ignored and canonical todo ids are assigned automatically. "
             "Use 'transition' for normal progress instead of rebuilding the whole list. "
@@ -533,7 +520,7 @@ class TodoWriteTool(Tool):
             "work. Revise the plan with plan_write before materially changing execution. "
             "Use this to decompose complex work into trackable steps "
             "and mark progress as you go: keep exactly the current item in_progress, mark "
-            "finished items completed, and move the next item to in_progress before working "
+            "finished items completed, and explicitly select the next item before working "
             "on it. This tool is only a progress tracker: it is not "
             "factual evidence, a search strategy, or a source for final conclusions. Do not "
             "narrow the user's request or lower verification standards because a todo exists."
@@ -554,10 +541,9 @@ class TodoWriteTool(Tool):
                     "description": (
                         "Complete ordered todo list for action='set'. This replaces the "
                         "current list. Each item requires task and status, with optional "
-                        "priority. When unfinished work remains, zero in_progress items "
-                        "activates the first unfinished item automatically; more than one "
-                        "in_progress item is invalid. An empty or fully completed list "
-                        "must contain none."
+                        "priority. When unfinished work remains, the complete list must "
+                        "contain exactly one in_progress item. An empty or fully completed "
+                        "list must contain none."
                     ),
                     "items": {
                         "type": "object",
@@ -575,9 +561,8 @@ class TodoWriteTool(Tool):
                                 "type": "string",
                                 "enum": list(_VALID_STATUSES),
                                 "description": (
-                                    "Required task status. If no unfinished item is marked "
-                                    "in_progress, the first unfinished item is activated "
-                                    "automatically."
+                                    "Required task status. Unfinished work requires exactly "
+                                    "one explicitly selected in_progress item."
                                 ),
                             },
                             "priority": {
@@ -596,9 +581,9 @@ class TodoWriteTool(Tool):
                 "next_todo_id": {
                     "type": "string",
                     "description": (
-                        "Pending todo to activate for action='transition'. Omit to "
-                        "activate the first pending item in list order automatically, "
-                        "or when completing the final unfinished todo."
+                        "Pending todo explicitly selected by the AI to activate for "
+                        "action='transition'. Required while pending work remains; omit "
+                        "only when completing the final unfinished todo."
                     ),
                 },
             },
